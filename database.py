@@ -47,6 +47,10 @@ CREATE TABLE IF NOT EXISTS eval_runs (
     progress_note     TEXT,               -- human-readable "what's happening now"
     error             TEXT,
     comparison_run_id INTEGER REFERENCES comparison_runs(id),
+    runtime           TEXT,               -- which local runtime served the model
+    quantization      TEXT,               -- as served, e.g. 'Q4_K_M' -- see ADDED_COLUMNS
+    perf_json         TEXT,               -- JSON: TTFT/throughput/token/cost measurements
+    vram_bytes        INTEGER,            -- accelerator memory held while the run was live
     started_at        TIMESTAMP,
     completed_at      TIMESTAMP
 );
@@ -141,6 +145,38 @@ CREATE INDEX IF NOT EXISTS idx_cmp_results   ON comparison_results(comparison_ru
 """
 
 
+# Columns added after the schema first shipped. `CREATE TABLE IF NOT EXISTS`
+# is a no-op on an existing table, so a database created by an earlier version
+# would silently lack these and every INSERT naming them would fail. Applying
+# them as idempotent ALTERs keeps existing runs -- and the history that makes
+# the dashboard worth having -- rather than asking anyone to delete the file.
+#
+# Additive only, by design. A column here is safe to apply to a live database;
+# anything that rewrites or drops data does not belong in this list.
+ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "eval_runs": {
+        "runtime": "TEXT",
+        "quantization": "TEXT",
+        "perf_json": "TEXT",
+        "vram_bytes": "INTEGER",
+    },
+}
+
+
+def _apply_added_columns(conn: sqlite3.Connection) -> None:
+    for table, columns in ADDED_COLUMNS.items():
+        try:
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        except sqlite3.Error:
+            continue          # table absent entirely; the schema script owns that
+        if not existing:
+            continue
+        for name, decl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                log.info("Added column %s.%s to the existing database.", table, name)
+
+
 def utcnow() -> str:
     """Timestamps are stored as UTC ISO-8601 strings -- sortable and portable."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -214,6 +250,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
         replaced = _known_db is not None
         conn.executescript(SCHEMA)
+        _apply_added_columns(conn)
         conn.commit()
         _known_db = identity        # set before hooks run, so they don't recurse
 
@@ -401,17 +438,20 @@ def create_eval_run(
     judge_model: str | None,
     total: int,
     comparison_run_id: int | None = None,
+    runtime: str | None = None,
+    quantization: str | None = None,
 ) -> int:
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO eval_runs
                  (model_name, model_type, model_id, metrics, dataset_id, judge_model,
                   status, progress_done, progress_total, progress_note,
-                  comparison_run_id, started_at)
-               VALUES (?,?,?,?,?,?,'queued',0,?,?,?,?)""",
+                  comparison_run_id, runtime, quantization, started_at)
+               VALUES (?,?,?,?,?,?,'queued',0,?,?,?,?,?,?)""",
             (
                 model_name, model_type, model_id, json.dumps(metrics), dataset_id,
-                judge_model, total, "Queued", comparison_run_id, utcnow(),
+                judge_model, total, "Queued", comparison_run_id,
+                runtime, quantization, utcnow(),
             ),
         )
         return int(cur.lastrowid)
@@ -422,6 +462,7 @@ def update_eval_run(run_id: int, **fields: Any) -> None:
     allowed = {
         "status", "progress_done", "progress_total", "progress_note",
         "error", "completed_at", "judge_model",
+        "runtime", "quantization", "perf_json", "vram_bytes",
     }
     unknown = set(fields) - allowed
     if unknown:

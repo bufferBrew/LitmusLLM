@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -35,7 +36,9 @@ import database
 from database import utcnow
 from llm_clients import JudgeModel, ModelCallError, TargetModel
 from metrics_catalog import MetricSpec, get_metric, missing_requirements, resolve_metrics
-from model_registry import ModelSpec, ensure_ollama_running, parse_model_id
+import perf
+import runtimes
+from model_registry import ModelSpec, parse_model_id
 
 log = logging.getLogger("litmusllm.runner")
 
@@ -262,8 +265,20 @@ async def _execute_run(
         progress_note=f"Warming up {model_spec.label}",
     )
 
-    if model_spec.kind == "local" or judge_spec.kind == "local":
-        await ensure_ollama_running()
+    # Start whichever local runtimes this run needs -- and only those. A run
+    # pitting an Ollama model against a cloud judge has no reason to boot
+    # llama.cpp. Deduplicated because target and judge are usually the same
+    # runtime, and starting it twice would just wait out the probe twice.
+    for runtime_key in {s.runtime for s in (model_spec, judge_spec) if s.kind == "local"}:
+        await runtimes.ensure_running(runtimes.get(runtime_key))
+
+    # Now that the runtime is up it can be asked what it is actually serving,
+    # which for Ollama is the only way to learn the quantization -- the tag
+    # doesn't carry it.
+    if model_spec.kind == "local":
+        served_at = await runtimes.quantization_for(model_spec.runtime, model_spec.name)
+        if served_at:
+            database.update_eval_run(run_id, quantization=served_at)
 
     target = TargetModel(model_spec)
     needs_tools = any("tools_called" in m.requires for m in metric_specs)
@@ -277,92 +292,116 @@ async def _execute_run(
     except ModelCallError as exc:
         raise ModelCallError(f"Model under test is not usable -- {exc}") from exc
 
+    # Read memory residency straight after the warm-up, which is the one moment
+    # the model is guaranteed to be loaded. Ollama evicts on a timer, so asking
+    # after the run would usually return nothing.
+    if model_spec.kind == "local":
+        vram = await runtimes.resident_memory(model_spec.runtime, model_spec.name)
+        if vram:
+            database.update_eval_run(run_id, vram_bytes=vram)
+
     # Every metric gets an explicit judge. DeepEval falls back to GPT-4o when
     # `model` is None -- including for metrics that look judge-free -- so an
     # omission here would break the local-first guarantee.
     judge = JudgeModel(judge_spec)
     metrics = [(spec, build_metric(spec, judge)) for spec in metric_specs]
 
+    # Speed and token accounting for the model under test only -- never the
+    # judge, whose latency is a property of this harness rather than of the
+    # model being characterised.
+    recorder = perf.PerfRecorder()
+
     consecutive_failures = 0
 
-    for index, row in enumerate(rows):
-        if cancel.is_set():
-            return "stopped"
-
-        database.update_eval_run(
-            run_id, progress_done=index,
-            progress_note=f"Generating answer {index + 1}/{total} with {model_spec.label}",
-        )
-
-        # -- phase 1: generation ------------------------------------------
-        try:
-            actual_output = await target.generate(build_prompt(row, grounded))
-            consecutive_failures = 0
-        except Exception as exc:  # noqa: BLE001 - recorded per case, not swallowed
-            consecutive_failures += 1
-            for spec, _ in metrics:
-                database.record_result(
-                    eval_run_id=run_id, case_index=index, test_case_input=row["input"],
-                    actual_output=None, metric_name=spec.label, score=None,
-                    reason=f"Generation failed: {exc}", passed=None,
-                    threshold=spec.threshold, status="error",
-                )
-            if consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
-                raise ModelCallError(
-                    f"{model_spec.label} failed to generate {consecutive_failures} times "
-                    f"in a row -- aborting. Last error: {exc}"
-                ) from exc
-            continue
-
-        # -- phase 2: judging ---------------------------------------------
-        for spec, metric in metrics:
+    # try/finally rather than a save at each exit: a stopped or aborted run
+    # has already paid for the tokens it generated, and its speed numbers are
+    # exactly as valid as a completed run's. Losing them because the user hit
+    # Stop would be throwing away measurements we already made.
+    try:
+        for index, row in enumerate(rows):
             if cancel.is_set():
-                database.update_eval_run(run_id, progress_done=index)
                 return "stopped"
 
-            missing = missing_requirements(spec, row)
-            if missing:
-                database.record_result(
-                    eval_run_id=run_id, case_index=index, test_case_input=row["input"],
-                    actual_output=actual_output, metric_name=spec.label, score=None,
-                    reason=(
-                        f"Skipped: this test case has no "
-                        f"{', '.join(m.replace('_', ' ') for m in missing)}. "
-                        f"{spec.requirement_label}."
-                    ),
-                    passed=None, threshold=spec.threshold, status="skipped",
-                )
-                continue
-
             database.update_eval_run(
-                run_id,
-                progress_note=f"Scoring {spec.label} on case {index + 1}/{total}",
+                run_id, progress_done=index,
+                progress_note=f"Generating answer {index + 1}/{total} with {model_spec.label}",
             )
 
-            test_case = build_test_case(row, actual_output, needs_tools)
+            # -- phase 1: generation ------------------------------------------
             try:
-                await metric.a_measure(test_case, **_measure_kwargs(metric))
-                score = float(metric.score) if metric.score is not None else None
-                passed = bool(metric.success) if metric.score is not None else None
-                database.record_result(
-                    eval_run_id=run_id, case_index=index, test_case_input=row["input"],
-                    actual_output=actual_output, metric_name=spec.label, score=score,
-                    reason=getattr(metric, "reason", None), passed=passed,
-                    threshold=spec.threshold, status="scored",
+                actual_output, call_metrics = await target.generate_measured(
+                    build_prompt(row, grounded)
                 )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - one bad case must not kill the run
-                log.warning("run %s: metric %s failed on case %s: %s",
-                            run_id, spec.key, index, exc)
-                database.record_result(
-                    eval_run_id=run_id, case_index=index, test_case_input=row["input"],
-                    actual_output=actual_output, metric_name=spec.label, score=None,
-                    reason=f"Metric error: {exc}", passed=None,
-                    threshold=spec.threshold, status="error",
+                recorder.add(call_metrics)
+                consecutive_failures = 0
+            except Exception as exc:  # noqa: BLE001 - recorded per case, not swallowed
+                consecutive_failures += 1
+                for spec, _ in metrics:
+                    database.record_result(
+                        eval_run_id=run_id, case_index=index, test_case_input=row["input"],
+                        actual_output=None, metric_name=spec.label, score=None,
+                        reason=f"Generation failed: {exc}", passed=None,
+                        threshold=spec.threshold, status="error",
+                    )
+                if consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
+                    raise ModelCallError(
+                        f"{model_spec.label} failed to generate {consecutive_failures} times "
+                        f"in a row -- aborting. Last error: {exc}"
+                    ) from exc
+                continue
+
+            # -- phase 2: judging ---------------------------------------------
+            for spec, metric in metrics:
+                if cancel.is_set():
+                    database.update_eval_run(run_id, progress_done=index)
+                    return "stopped"
+
+                missing = missing_requirements(spec, row)
+                if missing:
+                    database.record_result(
+                        eval_run_id=run_id, case_index=index, test_case_input=row["input"],
+                        actual_output=actual_output, metric_name=spec.label, score=None,
+                        reason=(
+                            f"Skipped: this test case has no "
+                            f"{', '.join(m.replace('_', ' ') for m in missing)}. "
+                            f"{spec.requirement_label}."
+                        ),
+                        passed=None, threshold=spec.threshold, status="skipped",
+                    )
+                    continue
+
+                database.update_eval_run(
+                    run_id,
+                    progress_note=f"Scoring {spec.label} on case {index + 1}/{total}",
                 )
 
-        database.update_eval_run(run_id, progress_done=index + 1)
+                test_case = build_test_case(row, actual_output, needs_tools)
+                try:
+                    await metric.a_measure(test_case, **_measure_kwargs(metric))
+                    score = float(metric.score) if metric.score is not None else None
+                    passed = bool(metric.success) if metric.score is not None else None
+                    database.record_result(
+                        eval_run_id=run_id, case_index=index, test_case_input=row["input"],
+                        actual_output=actual_output, metric_name=spec.label, score=score,
+                        reason=getattr(metric, "reason", None), passed=passed,
+                        threshold=spec.threshold, status="scored",
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - one bad case must not kill the run
+                    log.warning("run %s: metric %s failed on case %s: %s",
+                                run_id, spec.key, index, exc)
+                    database.record_result(
+                        eval_run_id=run_id, case_index=index, test_case_input=row["input"],
+                        actual_output=actual_output, metric_name=spec.label, score=None,
+                        reason=f"Metric error: {exc}", passed=None,
+                        threshold=spec.threshold, status="error",
+                    )
+
+            database.update_eval_run(run_id, progress_done=index + 1)
+
+    finally:
+        database.update_eval_run(run_id, perf_json=json.dumps(recorder.as_dict()))
 
     return "stopped" if cancel.is_set() else "completed"
 
@@ -413,6 +452,23 @@ async def _run_wrapper(
     return status
 
 
+def _quantization_of(spec: ModelSpec) -> str | None:
+    """A first guess at the serving precision, from the model name alone.
+
+    Only a guess: an Ollama tag like 'llama3.2:3b' carries no precision at all,
+    whereas a llama.cpp GGUF filename usually does. `_execute_run` replaces
+    this with the runtime's own answer as soon as the runtime is up -- this
+    exists so that a run which never gets that far still records something.
+
+    Cloud models return None: providers do not publish what precision they
+    serve at, and inventing a label would be worse than an honest blank.
+    """
+    if spec.kind != "local":
+        return None
+    inferred = runtimes.infer_quantization(spec.name)
+    return inferred if inferred != "unknown" else None
+
+
 def start_eval_run(
     *,
     model_id: str,
@@ -449,6 +505,8 @@ def start_eval_run(
         judge_model=judge_spec.label,
         total=len(rows),
         comparison_run_id=comparison_run_id,
+        runtime=model_spec.runtime if model_spec.kind == "local" else model_spec.provider,
+        quantization=_quantization_of(model_spec),
     )
 
     job = Job()

@@ -1,0 +1,36 @@
+{# Compact warning for the run/compare pages.
+
+   Deliberately only warns about the *default* runtime. LM Studio and
+   llama.cpp being down is the normal state for someone who only uses Ollama,
+   and a banner about a backend you never chose is noise, not information.
+   The full picture lives on /models. #}
+{% set default_status = (runtime_statuses or []) | selectattr("key", "equalto", default_runtime) | first %}
+{% if default_status and not default_status.up %}
+  <div class="rounded-lg border border-red-300 bg-red-50 p-4 text-sm text-red-800
+              dark:border-red-500/40 dark:bg-red-500/10 dark:text-red-300">
+    <p class="font-semibold">{{ default_status.label }} is not reachable</p>
+    <p class="mt-1 leading-relaxed">{{ default_status.error }}</p>
+    <div class="mt-2 flex flex-wrap items-center gap-2 text-xs">
+      {% if default_status.can_autostart %}
+        <button type="button"
+                hx-post="/api/runtimes/start" hx-vals='{"runtime": "{{ default_status.key }}"}'
+                hx-swap="none" hx-on::after-request="window.location.reload()"
+                class="rounded-md bg-red-600 px-2.5 py-1 font-medium text-white hover:bg-red-700">
+          Start {{ default_status.label }} <span class="lit-spin">&hellip;</span>
+        </button>
+        <span>LitmusLLM also starts it automatically when a run needs it.</span>
+      {% else %}
+        <span>
+          Run <code class="rounded bg-red-100 px-1 dark:bg-red-500/20">{{ default_status.start_hint }}</code>
+          in a terminal and reload this page.
+        </span>
+      {% endif %}
+    </div>
+  </div>
+{% elif runtime_error %}
+  <div class="rounded-lg border border-red-300 bg-red-50 p-4 text-sm text-red-800
+              dark:border-red-500/40 dark:bg-red-500/10 dark:text-red-300">
+    <p class="font-semibold">Local models could not be listed</p>
+    <p class="mt-1 leading-relaxed">{{ runtime_error }}</p>
+  </div>
+{% endif %}

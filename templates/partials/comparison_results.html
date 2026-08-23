@@ -34,11 +34,20 @@
   {% if model_labels and metric_labels %}
     <div class="mt-6 overflow-x-auto rounded-xl border border-slate-200 bg-white
                 dark:border-slate-800 dark:bg-slate-900">
-      <table class="w-full min-w-[40rem] text-sm">
+      <table class="w-full min-w-[56rem] text-sm">
         <thead class="border-b border-slate-200 text-left text-xs uppercase tracking-wide
                       text-slate-500 dark:border-slate-800 dark:text-slate-400">
           <tr>
             <th class="px-4 py-3 font-medium">Model</th>
+            {# Overall standing first: every model here ran the same dataset,
+               metrics and judge, so the composite ranks them fairly and is the
+               column most people actually want. The per-metric breakdown stays
+               to its right for anyone who needs to see where the score came
+               from -- an aggregate that hides its inputs is not much use. #}
+            <th class="px-4 py-3 text-right font-medium"
+                title="Mean of this model's metric averages, oriented so higher is better, scaled 0-100">
+              Litmus Score
+            </th>
             {% for label in metric_labels %}
               {% set spec = metric_by_label(label) %}
               <th class="px-4 py-3 text-right font-medium">
@@ -48,6 +57,10 @@
                 {% endif %}
               </th>
             {% endfor %}
+            <th class="px-4 py-3 text-right font-medium"
+                title="Median output speed and time to first token for the model under test">
+              Speed
+            </th>
           </tr>
         </thead>
         <tbody class="divide-y divide-slate-100 dark:divide-slate-800">
@@ -59,6 +72,36 @@
                   <a href="/runs/{{ child.id }}" class="font-mono text-xs hover:underline">{{ model }}</a>
                 {% else %}
                   <span class="font-mono text-xs">{{ model }}</span>
+                {% endif %}
+                {% if child and (child.runtime or child.quantization) %}
+                  <span class="block text-[10px] text-slate-400 dark:text-slate-500">
+                    {{ child.runtime or '' }}{% if child.runtime and child.quantization %} &middot; {% endif %}
+                    {{- child.quantization or '' }}
+                  </span>
+                {% endif %}
+              </td>
+              {% set comp = composites.get(model) %}
+              <td class="px-4 py-3 text-right tabular-nums">
+                {% if comp %}
+                  {% set rank = overall_rank.get(model) %}
+                  {% set band = {'strong': 'emerald', 'fair': 'lime', 'weak': 'amber', 'poor': 'red'}[comp.band] %}
+                  <div class="flex items-center justify-end gap-1.5">
+                    <span class="text-lg font-semibold text-{{ band }}-600 dark:text-{{ band }}-400">
+                      {{ '%.1f'|format(comp.score) }}
+                    </span>
+                    <span class="rounded px-1.5 py-0.5 text-[10px] font-medium
+                                 {% if rank == 1 %}bg-emerald-100 text-emerald-700
+                                    dark:bg-emerald-500/15 dark:text-emerald-300
+                                 {% else %}bg-slate-100 text-slate-600
+                                    dark:bg-slate-800 dark:text-slate-300{% endif %}"
+                          title="overall rank">#{{ rank }}</span>
+                  </div>
+                  <span class="text-[11px] text-slate-400">
+                    {{ comp.metric_count }} metrics &middot; {{ comp.cases }} cases
+                    {%- if comp.thin %} <span class="text-amber-500" title="{{ comp.caveat }}">!</span>{% endif %}
+                  </span>
+                {% else %}
+                  <span class="text-slate-400">--</span>
                 {% endif %}
               </td>
               {% for label in metric_labels %}
@@ -90,6 +133,19 @@
                   {% endif %}
                 </td>
               {% endfor %}
+              {# Speed sits last: in a bake-off the quality columns are what you
+                 read first, and what it cost is the tie-breaker. #}
+              <td class="px-4 py-3 text-right tabular-nums">
+                {% set measured = run_perf(child) if child else none %}
+                {% if measured and measured.measured %}
+                  <span class="text-xs font-medium">{{ measured.tps_label }}</span>
+                  <span class="block text-[11px] text-slate-400">
+                    {{ measured.ttft_label }} to first token
+                  </span>
+                {% else %}
+                  <span class="text-slate-400">--</span>
+                {% endif %}
+              </td>
             </tr>
           {% endfor %}
         </tbody>
@@ -109,7 +165,10 @@
       <p class="mt-3 text-xs text-slate-500 dark:text-slate-400">
         All metrics are on a 0&ndash;1 scale. Bars for Toxicity, Bias and Hallucination are
         marked <span class="text-sky-500">&darr;</span> in the table above &mdash; for those,
-        a shorter bar is better.
+        a shorter bar is better. The Litmus Score column collapses these into one
+        0&ndash;100 figure; it ranks these models against each other, not against
+        <a href="/reference" class="underline hover:no-underline">published index scores</a>,
+        which measure different things entirely.
       </p>
     </div>
 

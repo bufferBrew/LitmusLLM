@@ -19,9 +19,15 @@
     </p>
     <p class="mt-2">
       Your own eval runs measure something different &mdash; an LLM judge scoring your
-      prompts on a 0&ndash;1 scale. A model scoring 0.9 Answer Relevancy on your dataset
-      and a model scoring 63 here have not been compared. LitmusLLM keeps the two apart
-      everywhere in the UI for exactly that reason.
+      prompts. A model scoring 0.9 Answer Relevancy on your dataset and a model scoring
+      63 here have not been compared. LitmusLLM keeps the two apart everywhere in the UI
+      for exactly that reason.
+    </p>
+    <p class="mt-2">
+      That includes the <strong>Litmus Score</strong> on your runs. It is also 0&ndash;100,
+      which makes the collision tempting &mdash; but it is the mean of your chosen metrics
+      as graded by your chosen judge, not a benchmark result. It ranks your runs against
+      each other, never against this table.
     </p>
   </div>
 
