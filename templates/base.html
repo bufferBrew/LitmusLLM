@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}LitmusLLM{% endblock %}</title>
+
+  <!-- Dark-mode class is applied before paint to avoid a light flash. -->
+  <script>
+    (function () {
+      var saved = localStorage.getItem('litmusllm-theme');
+      var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+      if (saved === 'dark' || (!saved && prefersDark)) {
+        document.documentElement.classList.add('dark');
+      }
+    })();
+  </script>
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { darkMode: 'class' };</script>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#9749;</text></svg>">
+</head>
+<body class="h-full bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100 antialiased">
+
+<nav class="border-b border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900">
+  <div class="mx-auto flex max-w-7xl flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3">
+    <a href="/" class="flex items-center gap-2 font-semibold tracking-tight">
+      <span class="text-xl" aria-hidden="true">&#9749;</span>
+      <span>LitmusLLM</span>
+    </a>
+
+    {% set tabs = [('run', '/', 'New run'), ('dashboard', '/dashboard', 'Dashboard'),
+                   ('compare', '/compare', 'Compare'), ('models', '/models', 'Models'),
+                   ('reference', '/reference', 'Reference')] %}
+    <div class="flex flex-wrap items-center gap-1 text-sm">
+      {% for key, href, label in tabs %}
+        <a href="{{ href }}"
+           class="rounded-md px-3 py-1.5 transition
+                  {% if active == key %}bg-amber-100 font-medium text-amber-900 dark:bg-amber-500/15 dark:text-amber-300
+                  {% else %}text-slate-600 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800{% endif %}">
+          {{ label }}
+        </a>
+      {% endfor %}
+    </div>
+
+    <button type="button" onclick="toggleTheme()"
+            class="ml-auto rounded-md border border-slate-300 px-2.5 py-1.5 text-sm text-slate-600
+                   hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+            aria-label="Toggle dark mode">
+      <span class="dark:hidden" aria-hidden="true">&#9789;</span>
+      <span class="hidden dark:inline" aria-hidden="true">&#9788;</span>
+    </button>
+  </div>
+</nav>
+
+<main class="mx-auto max-w-7xl px-4 py-8">
+  {% block content %}{% endblock %}
+</main>
+
+<footer class="mx-auto max-w-7xl px-4 pb-10 text-xs text-slate-400 dark:text-slate-600">
+  LitmusLLM &middot; local-first LLM evaluation &middot; everything stays on this machine
+  unless you select a cloud model.
+</footer>
+
+<script>
+  function toggleTheme() {
+    var root = document.documentElement;
+    var isDark = root.classList.toggle('dark');
+    localStorage.setItem('litmusllm-theme', isDark ? 'dark' : 'light');
+    // Charts bake their colours in at render time, so redraw on theme change.
+    if (window.litRedrawCharts) window.litRedrawCharts();
+  }
+</script>
+<script src="/static/app.js"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

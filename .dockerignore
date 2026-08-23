@@ -1,0 +1,11 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.git/
+.env
+data/
+!data/uploads/.gitkeep
+*.md
+.DS_Store
+graphify-out/

@@ -1,0 +1,158 @@
+{% extends "base.html" %}
+{% block title %}Published benchmarks &middot; LitmusLLM{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+  <header>
+    <h1 class="text-2xl font-semibold tracking-tight">Published benchmarks</h1>
+    <p class="mt-1 max-w-3xl text-sm text-slate-600 dark:text-slate-400">
+      Where the frontier sits, according to someone who already paid for the API calls.
+      Nothing here was measured by LitmusLLM.
+    </p>
+  </header>
+
+  <div class="rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm leading-relaxed
+              text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-200">
+    <p class="font-semibold">Read this before comparing anything.</p>
+    <p class="mt-1">
+      These are <strong>{{ reference_source }}</strong> scores: {{ reference_note }}
+    </p>
+    <p class="mt-2">
+      Your own eval runs measure something different &mdash; an LLM judge scoring your
+      prompts on a 0&ndash;1 scale. A model scoring 0.9 Answer Relevancy on your dataset
+      and a model scoring 63 here have not been compared. LitmusLLM keeps the two apart
+      everywhere in the UI for exactly that reason.
+    </p>
+  </div>
+
+  {% if local_families %}
+    <div class="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+      <h2 class="text-sm font-semibold">Your local model families</h2>
+      <p class="mt-1 text-sm text-slate-600 dark:text-slate-400">
+        You have {{ local_families|join(', ') }} models pulled. Their rows are highlighted below.
+      </p>
+      <p class="mt-2 rounded-lg bg-slate-50 p-3 text-xs leading-relaxed text-slate-600
+                dark:bg-slate-950 dark:text-slate-400">
+        <strong>A coverage gap worth knowing about:</strong> this index tracks current
+        models. The 2024-era small models most people run locally &mdash;
+        <code>llama3.1:8b</code>, <code>qwen2.5:14b</code>, <code>gemma2:2b</code>,
+        <code>phi3.5</code>, <code>llama3.2:3b</code> &mdash; have aged off it entirely and
+        have <strong>no row here</strong>. A blank is honest; an invented number would not
+        be. The modern small open-weight entries (Qwen3.5 4B, Ministral 3 8B, Phi-4 Mini)
+        are the closest available anchors for that size class. Add your own rows below if
+        you have figures you trust.
+      </p>
+    </div>
+  {% endif %}
+
+  <div class="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
+    <h2 class="text-lg font-medium">Top 24 by index score</h2>
+    <div class="mt-4" style="height: 26rem">
+      <canvas id="ref-chart"></canvas>
+    </div>
+    <script id="ref-chart-data" type="application/json">{{ reference_chart|safe }}</script>
+  </div>
+
+  <div class="overflow-x-auto rounded-xl border border-slate-200 bg-white
+              dark:border-slate-800 dark:bg-slate-900">
+    <table class="w-full min-w-[48rem] text-sm">
+      <thead class="border-b border-slate-200 text-left text-xs uppercase tracking-wide
+                    text-slate-500 dark:border-slate-800 dark:text-slate-400">
+        <tr>
+          <th class="px-4 py-3 font-medium">Model</th>
+          <th class="px-4 py-3 font-medium">Vendor</th>
+          <th class="px-4 py-3 font-medium">Type</th>
+          <th class="px-4 py-3 text-right font-medium">Index score</th>
+          <th class="px-4 py-3 font-medium">Source</th>
+          <th class="px-4 py-3"></th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-100 dark:divide-slate-800">
+        {% for r in reference_rows %}
+          <tr class="{% if r.family in highlight_families %}bg-amber-50/60 dark:bg-amber-500/5{% endif %}">
+            <td class="px-4 py-2.5">
+              <span class="font-medium">{{ r.model_label }}</span>
+              {% if r.variant %}<span class="text-xs text-slate-400">({{ r.variant }})</span>{% endif %}
+              {% if r.family in highlight_families %}
+                <span class="ml-1 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium
+                             text-amber-800 dark:bg-amber-500/20 dark:text-amber-300">your family</span>
+              {% endif %}
+            </td>
+            <td class="px-4 py-2.5 text-xs text-slate-500 dark:text-slate-400">{{ r.vendor or '--' }}</td>
+            <td class="px-4 py-2.5">
+              <span class="rounded px-1.5 py-0.5 text-[10px] font-medium uppercase
+                    {% if r.kind == 'frontier' %}bg-purple-100 text-purple-700 dark:bg-purple-500/15 dark:text-purple-300
+                    {% else %}bg-teal-100 text-teal-700 dark:bg-teal-500/15 dark:text-teal-300{% endif %}">
+                {{ 'frontier' if r.kind == 'frontier' else 'open weight' }}
+              </span>
+            </td>
+            <td class="px-4 py-2.5 text-right font-semibold tabular-nums">{{ '%.1f'|format(r.score) }}</td>
+            <td class="px-4 py-2.5 text-xs text-slate-500 dark:text-slate-400">
+              {% if r.source_url %}
+                <a href="{{ r.source_url }}" target="_blank" rel="noopener noreferrer"
+                   class="underline">{{ r.source_name or 'source' }}</a>
+              {% else %}{{ r.source_name or '--' }}{% endif %}
+              <span class="block text-[10px] text-slate-400">{{ r.retrieved_at or '' }}</span>
+            </td>
+            <td class="px-4 py-2.5 text-right">
+              <form method="post" action="/api/reference/{{ r.id }}/delete">
+                <button type="submit" class="text-xs text-slate-400 hover:text-red-600">remove</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <section class="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
+    <h2 class="text-lg font-medium">Add a figure</h2>
+    <p class="mt-1 text-sm text-slate-600 dark:text-slate-400">
+      Got a number from a source you trust? Add it. Please record where it came from &mdash;
+      an unattributed benchmark figure is worth very little six months later.
+    </p>
+    <form method="post" action="/api/reference" class="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      {% set field = "mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950" %}
+      <label class="text-xs font-medium">Model label*
+        <input type="text" name="model_label" required placeholder="Claude Opus 5" class="{{ field }}">
+      </label>
+      <label class="text-xs font-medium">Score (0&ndash;100)*
+        <input type="number" name="score" step="0.1" min="0" max="100" required class="{{ field }}">
+      </label>
+      <label class="text-xs font-medium">Vendor
+        <input type="text" name="vendor" placeholder="Anthropic" class="{{ field }}">
+      </label>
+      <label class="text-xs font-medium">Family
+        <input type="text" name="family" placeholder="Claude" class="{{ field }}">
+      </label>
+      <label class="text-xs font-medium">Variant
+        <input type="text" name="variant" placeholder="high" class="{{ field }}">
+      </label>
+      <label class="text-xs font-medium">Type
+        <select name="kind" class="{{ field }}">
+          <option value="frontier">Frontier / proprietary</option>
+          <option value="open_weight">Open weight</option>
+        </select>
+      </label>
+      <label class="text-xs font-medium">Benchmark / index
+        <input type="text" name="index_name" placeholder="MMLU (5-shot)" class="{{ field }}">
+      </label>
+      <label class="text-xs font-medium">Source URL
+        <input type="url" name="source_url" placeholder="https://..." class="{{ field }}">
+      </label>
+      <div class="sm:col-span-2 lg:col-span-4">
+        <button type="submit"
+                class="rounded-md bg-amber-500 px-4 py-2 text-sm font-medium text-white
+                       hover:bg-amber-600">Add figure</button>
+        <a href="/api/reference/export.csv" class="ml-3 text-xs text-amber-600 underline">
+          Export the whole table as CSV
+        </a>
+      </div>
+    </form>
+  </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/reference-chart.js"></script>
+{% endblock %}

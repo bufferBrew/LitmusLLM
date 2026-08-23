@@ -1,0 +1,49 @@
+/* A handful of rules Tailwind utilities can't express inline. */
+
+/* Info tooltips on the metric cards: pure CSS, no JS, keyboard-reachable
+   because the trigger is a <button> and :focus-within counts as a trigger. */
+.lit-tip { position: relative; }
+.lit-tip__body {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  width: 18rem;
+  z-index: 30;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity .12s ease;
+  pointer-events: none;
+}
+.lit-tip:hover .lit-tip__body,
+.lit-tip:focus-within .lit-tip__body { opacity: 1; visibility: visible; }
+
+/* Keep the tooltip on screen for cards near the right edge. */
+.lit-tip--end .lit-tip__body { left: auto; right: 0; transform: none; }
+
+/* Selected state for the metric / model pick cards, driven by the hidden
+   checkbox or radio so the whole card is one big label. */
+.lit-pick input:checked ~ .lit-pick__frame {
+  border-color: rgb(245 158 11);
+  background-color: rgb(254 252 232);
+  box-shadow: 0 0 0 1px rgb(245 158 11);
+}
+.dark .lit-pick input:checked ~ .lit-pick__frame {
+  background-color: rgb(245 158 11 / .12);
+}
+.lit-pick input:focus-visible ~ .lit-pick__frame {
+  outline: 2px solid rgb(59 130 246);
+  outline-offset: 2px;
+}
+.lit-pick input:disabled ~ .lit-pick__frame { opacity: .5; cursor: not-allowed; }
+
+/* HTMX request indicator. */
+.htmx-request .lit-spin { display: inline-block; }
+.lit-spin { display: none; }
+
+/* Long model outputs get their own scroll area rather than stretching a row. */
+.lit-clamp {
+  max-height: 9rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}

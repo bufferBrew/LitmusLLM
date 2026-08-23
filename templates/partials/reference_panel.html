@@ -1,0 +1,84 @@
+{# Published third-party figures.
+   The visual separation here is load-bearing, not decorative: a dashed
+   border, a different accent colour and an explicit disclaimer keep these
+   numbers from reading as though LitmusLLM measured them. They are never
+   plotted on the same axis as a measured score. #}
+<section class="rounded-xl border-2 border-dashed border-slate-300 bg-slate-50 p-5
+                dark:border-slate-700 dark:bg-slate-950">
+  <div class="flex flex-wrap items-start justify-between gap-3">
+    <div>
+      <h2 class="flex items-center gap-2 text-lg font-medium">
+        <span class="rounded bg-slate-200 px-2 py-0.5 text-[10px] font-bold uppercase
+                     tracking-wider text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+          Reference
+        </span>
+        Published benchmarks
+      </h2>
+      <p class="mt-1 max-w-2xl text-sm text-slate-600 dark:text-slate-400">
+        Measured by a third party, not by LitmusLLM. Shown for context only.
+      </p>
+    </div>
+    <a href="/reference" class="text-sm text-amber-600 hover:underline">Full table &rarr;</a>
+  </div>
+
+  <div class="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs leading-relaxed
+              text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-200">
+    <strong>These numbers are not comparable to the scores above.</strong>
+    Your eval scores are an LLM judge rating <em>your</em> prompts on a 0&ndash;1 scale.
+    The figures below are an aggregate of ten fixed public benchmarks on a 0&ndash;100
+    scale, run by {{ reference_source }}. Different test, different scale, different
+    question &mdash; which is why they get their own panel and their own chart.
+  </div>
+
+  {% if highlight_families %}
+    <p class="mt-3 text-xs text-slate-500 dark:text-slate-400">
+      Rows in the same model family as something you ran are marked
+      <span class="rounded bg-amber-100 px-1.5 py-0.5 font-medium text-amber-800
+                   dark:bg-amber-500/20 dark:text-amber-300">family match</span>.
+      That is a family hint only &mdash; a 2024 <code>llama3.1:8b</code> is not the
+      Llama 4 listed here.
+    </p>
+  {% endif %}
+
+  <div class="mt-4 grid gap-4 lg:grid-cols-2">
+    {% for group, rows in [('Frontier / proprietary', reference_frontier),
+                           ('Open weight', reference_open)] %}
+      <div>
+        <h3 class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500
+                   dark:text-slate-400">{{ group }}</h3>
+        <div class="max-h-72 overflow-y-auto rounded-lg border border-slate-200 bg-white
+                    dark:border-slate-800 dark:bg-slate-900">
+          <table class="w-full text-sm">
+            <tbody class="divide-y divide-slate-100 dark:divide-slate-800">
+              {% for r in rows[:14] %}
+                <tr class="{% if r.family in highlight_families %}bg-amber-50/60 dark:bg-amber-500/5{% endif %}">
+                  <td class="px-3 py-2">
+                    <span class="font-medium">{{ r.model_label }}</span>
+                    {% if r.variant %}
+                      <span class="text-xs text-slate-400">({{ r.variant }})</span>
+                    {% endif %}
+                    {% if r.family in highlight_families %}
+                      <span class="ml-1 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium
+                                   text-amber-800 dark:bg-amber-500/20 dark:text-amber-300">family</span>
+                    {% endif %}
+                    <span class="block text-[11px] text-slate-400">{{ r.vendor }}</span>
+                  </td>
+                  <td class="px-3 py-2 text-right">
+                    <span class="font-semibold tabular-nums">{{ '%.1f'|format(r.score) }}</span>
+                    <span class="block text-[10px] text-slate-400">/ 100</span>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+
+  <p class="mt-3 text-[11px] text-slate-500 dark:text-slate-400">
+    Source: <a href="{{ reference_source_url }}" target="_blank" rel="noopener noreferrer"
+               class="underline">{{ reference_source }}</a>,
+    retrieved {{ reference_retrieved }}. Leaderboards move &mdash; re-check before quoting.
+  </p>
+</section>

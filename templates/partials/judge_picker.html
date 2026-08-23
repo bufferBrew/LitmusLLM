@@ -1,0 +1,29 @@
+{# The judge is the model that *scores* answers -- separate from the model
+   being tested. Judge quality dominates result quality, so this gets its own
+   explanatory block rather than being buried in a settings page. #}
+<div>
+  <label for="judge-{{ scope|default('run') }}" class="block text-sm font-medium">Judge model</label>
+  <p class="mt-1 text-xs text-slate-500 dark:text-slate-400">
+    Grades the answers. Keep it fixed across runs you intend to compare &mdash; changing
+    the judge changes the scores. 7B+ recommended; smaller models struggle to emit the
+    structured JSON DeepEval needs.
+  </p>
+  <select id="judge-{{ scope|default('run') }}" name="judge"
+          class="mt-2 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm
+                 dark:border-slate-700 dark:bg-slate-900">
+    <optgroup label="Local (Ollama)">
+      {% for m in chat_models %}
+        <option value="{{ m.id }}" {% if m.name == default_judge %}selected{% endif %}>
+          {{ m.name }} &mdash; {{ m.parameter_size }}
+        </option>
+      {% endfor %}
+    </optgroup>
+    <optgroup label="Cloud (needs an API key)">
+      {% for m in flagship_models %}
+        <option value="{{ m.id }}" {% if not m.key_present %}disabled{% endif %}>
+          {{ m.label }}{% if not m.key_present %} &mdash; set {{ m.api_key_env }}{% endif %}
+        </option>
+      {% endfor %}
+    </optgroup>
+  </select>
+</div>

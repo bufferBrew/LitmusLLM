@@ -1,0 +1,12 @@
+<div>
+  <label for="dataset-{{ scope|default('run') }}" class="block text-sm font-medium">Dataset</label>
+  <select id="dataset-{{ scope|default('run') }}" name="dataset_id"
+          class="mt-2 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm
+                 dark:border-slate-700 dark:bg-slate-900">
+    {% for d in datasets %}
+      <option value="{{ d.id }}">
+        {{ d.name }} &mdash; {{ d.row_count }} cases{% if d.is_builtin %} (built-in){% endif %}
+      </option>
+    {% endfor %}
+  </select>
+</div>

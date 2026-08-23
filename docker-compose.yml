@@ -1,0 +1,67 @@
+# LitmusLLM + Ollama, both local.
+#
+#   docker compose up -d
+#   docker compose exec ollama ollama pull llama3.1:8b   # pull a first model
+#   open http://localhost:8000
+#
+# Models are stored in the named volume `ollama-models`. To reuse models you
+# have already pulled on the host instead, swap that volume line for:
+#     - ~/.ollama:/root/.ollama
+# (see the README -- the bind mount shares one model store between the host
+# Ollama and this container, so don't run both at once.)
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: litmusllm-ollama
+    ports:
+      - "11434:11434"          # exposed so the host CLI can talk to it too
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+    healthcheck:
+      # The image has no curl; ollama's own CLI is the reliable probe.
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    # --- GPU (NVIDIA) ---------------------------------------------------
+    # Uncomment to give Ollama the GPU. Needs the NVIDIA Container Toolkit.
+    # Not applicable on Apple Silicon: Docker cannot reach the Metal GPU, so
+    # a containerised Ollama runs on CPU. Run Ollama natively on macOS for
+    # GPU speed (see the README).
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  app:
+    build: .
+    container_name: litmusllm-app
+    ports:
+      - "8000:8000"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      LOCAL_MODEL_BASE_URL: http://ollama:11434/v1
+      LITMUSLLM_DB_PATH: /app/data/litmusllm.db
+      LITMUSLLM_DEFAULT_JUDGE: ${LITMUSLLM_DEFAULT_JUDGE:-llama3.1:8b}
+      # Cloud keys are optional -- absent ones simply grey out those models.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      TOGETHER_API_KEY: ${TOGETHER_API_KEY:-}
+    volumes:
+      # Eval history and uploaded datasets survive `docker compose down`.
+      - ./data:/app/data
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  ollama-models:

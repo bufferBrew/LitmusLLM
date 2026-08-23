@@ -1,0 +1,188 @@
+{% extends "base.html" %}
+{% block title %}New run &middot; LitmusLLM{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+  <header>
+    <h1 class="text-2xl font-semibold tracking-tight">Run an evaluation</h1>
+    <p class="mt-1 text-sm text-slate-600 dark:text-slate-400">
+      Pick a model, choose what to measure, and start. Results stream into the dashboard
+      as each test case is scored.
+    </p>
+  </header>
+
+  {% include "partials/ollama_warning.html" %}
+
+  <form method="post" action="/api/evals/start" class="space-y-6">
+    <!-- Step 1: model under test -->
+    <section class="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
+      <div class="flex items-baseline gap-2">
+        <span class="flex h-6 w-6 items-center justify-center rounded-full bg-amber-500 text-xs
+                     font-bold text-white">1</span>
+        <h2 class="text-lg font-medium">Model under test</h2>
+      </div>
+
+      {% if chat_models %}
+        <div class="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          {% for m in chat_models %}
+            <label class="lit-pick block cursor-pointer">
+              <input type="radio" name="model" value="{{ m.id }}" class="sr-only"
+                     {% if loop.first %}checked{% endif %} required>
+              <div class="lit-pick__frame h-full rounded-lg border border-slate-200 bg-white p-3
+                          transition hover:border-amber-300 dark:border-slate-800 dark:bg-slate-950">
+                <p class="font-mono text-sm font-medium">{{ m.name }}</p>
+                <p class="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                  {{ m.parameter_size }} &middot; {{ m.quantization }} &middot; {{ m.size }}
+                </p>
+              </div>
+            </label>
+          {% endfor %}
+        </div>
+      {% elif not ollama_error %}
+        <p class="mt-4 rounded-lg bg-slate-100 p-4 text-sm text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+          No Ollama models found. Pull one from the
+          <a href="/models" class="font-medium text-amber-600 underline">Models</a> page, or run
+          <code class="rounded bg-slate-200 px-1 dark:bg-slate-700">ollama pull llama3.1</code>.
+        </p>
+      {% endif %}
+
+      <details class="mt-4">
+        <summary class="cursor-pointer text-sm text-slate-600 hover:text-amber-600 dark:text-slate-400">
+          Or evaluate a flagship cloud model
+        </summary>
+        <div class="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          {% for m in flagship_models %}
+            <label class="lit-pick block {% if m.key_present %}cursor-pointer{% endif %}">
+              <input type="radio" name="model" value="{{ m.id }}" class="sr-only"
+                     {% if not m.key_present %}disabled{% endif %}>
+              <div class="lit-pick__frame h-full rounded-lg border border-slate-200 bg-white p-3
+                          dark:border-slate-800 dark:bg-slate-950">
+                <p class="text-sm font-medium">{{ m.label }}</p>
+                <p class="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                  {% if m.key_present %}{{ m.provider }}
+                  {% else %}<span class="text-red-500">needs {{ m.api_key_env }}</span>{% endif %}
+                </p>
+              </div>
+            </label>
+          {% endfor %}
+        </div>
+      </details>
+    </section>
+
+    <!-- Step 2: metrics -->
+    <section class="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
+      <div class="flex items-baseline gap-2">
+        <span class="flex h-6 w-6 items-center justify-center rounded-full bg-amber-500 text-xs
+                     font-bold text-white">2</span>
+        <h2 class="text-lg font-medium">What to measure</h2>
+        <span class="text-xs text-slate-500 dark:text-slate-400">
+          &mdash; select any number; hover the <strong>i</strong> for an explanation
+        </span>
+      </div>
+      <div class="mt-4">
+        {% include "partials/metric_picker.html" %}
+      </div>
+    </section>
+
+    <!-- Step 3: data + judge -->
+    <section class="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
+      <div class="flex items-baseline gap-2">
+        <span class="flex h-6 w-6 items-center justify-center rounded-full bg-amber-500 text-xs
+                     font-bold text-white">3</span>
+        <h2 class="text-lg font-medium">Data &amp; judge</h2>
+      </div>
+
+      <div class="mt-4 grid gap-6 md:grid-cols-2">
+        <div class="space-y-3">
+          {% with scope='run' %}{% include "partials/dataset_picker.html" %}{% endwith %}
+          <div class="rounded-lg bg-slate-50 p-3 text-xs text-slate-600 dark:bg-slate-950 dark:text-slate-400">
+            {% for d in datasets %}
+              {% set caps = dataset_caps[d.id] %}
+              <p class="{% if not loop.first %}mt-2 {% endif %}"><span class="font-medium">{{ d.name }}:</span>
+                {{ caps.total }} cases &middot; {{ caps.with_expected_output }} with expected output
+                &middot; {{ caps.with_context }} with context
+                {%- if caps.with_tools %} &middot; {{ caps.with_tools }} with tool traces{% endif %}
+              </p>
+            {% endfor %}
+            <p class="mt-2 text-slate-500">
+              Metrics that need a field are skipped (with a note) on cases that lack it.
+            </p>
+          </div>
+        </div>
+
+        {% with scope='run' %}{% include "partials/judge_picker.html" %}{% endwith %}
+      </div>
+    </section>
+
+    <div class="flex flex-wrap items-center gap-3">
+      <button type="submit"
+              class="rounded-lg bg-amber-500 px-5 py-2.5 text-sm font-semibold text-white shadow-sm
+                     hover:bg-amber-600 focus-visible:outline focus-visible:outline-2
+                     focus-visible:outline-offset-2 focus-visible:outline-amber-500">
+        Start evaluation
+      </button>
+      <p class="text-xs text-slate-500 dark:text-slate-400">
+        Local runs cost nothing but time &mdash; expect a few seconds per case per metric.
+      </p>
+    </div>
+  </form>
+
+  <!-- Custom dataset upload -->
+  <section class="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
+    <h2 class="text-lg font-medium">Upload a dataset</h2>
+    <p class="mt-1 text-sm text-slate-600 dark:text-slate-400">
+      CSV with an <code class="rounded bg-slate-100 px-1 dark:bg-slate-800">input</code> column
+      (required) plus optional
+      <code class="rounded bg-slate-100 px-1 dark:bg-slate-800">expected_output</code>,
+      <code class="rounded bg-slate-100 px-1 dark:bg-slate-800">context</code>,
+      <code class="rounded bg-slate-100 px-1 dark:bg-slate-800">tools_called</code> and
+      <code class="rounded bg-slate-100 px-1 dark:bg-slate-800">expected_tools</code>.
+      Separate multiple context chunks with <code class="rounded bg-slate-100 px-1 dark:bg-slate-800">|</code>.
+    </p>
+    <form method="post" action="/api/datasets/upload" enctype="multipart/form-data"
+          class="mt-4 flex flex-wrap items-end gap-3">
+      <input type="hidden" name="redirect" value="/">
+      <div>
+        <label for="ds-name" class="block text-xs font-medium">Name (optional)</label>
+        <input id="ds-name" type="text" name="name" placeholder="Support tickets Q3"
+               class="mt-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm
+                      dark:border-slate-700 dark:bg-slate-950">
+      </div>
+      <div>
+        <label for="ds-file" class="block text-xs font-medium">CSV file</label>
+        <input id="ds-file" type="file" name="file" accept=".csv,text/csv" required
+               class="mt-1 block text-sm file:mr-3 file:rounded-md file:border-0 file:bg-slate-100
+                      file:px-3 file:py-2 file:text-sm file:font-medium dark:file:bg-slate-800">
+      </div>
+      <button type="submit"
+              class="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium
+                     hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800">Upload</button>
+      <a href="/api/datasets/{{ datasets[0].id }}/export.csv"
+         class="text-xs text-amber-600 underline">Download the built-in set as a template</a>
+    </form>
+  </section>
+
+  {% if recent_runs %}
+    <section>
+      <h2 class="mb-2 text-sm font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+        Recent runs
+      </h2>
+      <div class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+        {% for run in recent_runs %}
+          <a href="/runs/{{ run.id }}"
+             class="rounded-lg border border-slate-200 bg-white p-3 text-sm hover:border-amber-300
+                    dark:border-slate-800 dark:bg-slate-900">
+            <div class="flex items-center justify-between gap-2">
+              <span class="font-mono text-xs">{{ run.model_name }}</span>
+              {% include "partials/status_badge.html" %}
+            </div>
+            <p class="mt-1 text-xs text-slate-500 dark:text-slate-400">
+              {% for s in run.summary %}{{ s.metric_name }} {{ s.average_score|score }}{% if not loop.last %} &middot; {% endif %}{% else %}no scores yet{% endfor %}
+            </p>
+          </a>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+</div>
+{% endblock %}

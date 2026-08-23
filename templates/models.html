@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Models &middot; LitmusLLM{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+  <header class="flex flex-wrap items-end justify-between gap-3">
+    <div>
+      <h1 class="text-2xl font-semibold tracking-tight">Models</h1>
+      <p class="mt-1 text-sm text-slate-600 dark:text-slate-400">
+        Everything LitmusLLM can evaluate or use as a judge.
+      </p>
+    </div>
+    <button type="button" hx-get="/ui/models-grid" hx-target="#models-grid" hx-swap="innerHTML"
+            class="rounded-md border border-slate-300 px-3 py-1.5 text-sm hover:bg-slate-100
+                   dark:border-slate-700 dark:hover:bg-slate-800">
+      Refresh <span class="lit-spin">&hellip;</span>
+    </button>
+  </header>
+
+  <div id="models-grid">
+    {% include "partials/models_grid.html" %}
+  </div>
+</div>
+{% endblock %}

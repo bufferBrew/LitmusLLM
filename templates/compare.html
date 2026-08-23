@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block title %}Compare &middot; LitmusLLM{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+  <header>
+    <h1 class="text-2xl font-semibold tracking-tight">Compare models</h1>
+    <p class="mt-1 text-sm text-slate-600 dark:text-slate-400">
+      Run identical metrics over identical data on several models, then rank them.
+      Mix local Ollama models with flagship cloud models to see how far behind (or not)
+      your local setup really is.
+    </p>
+  </header>
+
+  {% include "partials/ollama_warning.html" %}
+
+  <form method="post" action="/api/compare" class="space-y-6">
+    <section class="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
+      <h2 class="text-lg font-medium">Models</h2>
+      <p class="mt-1 text-sm text-slate-600 dark:text-slate-400">Pick at least two.</p>
+
+      <h3 class="mt-4 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+        Local (Ollama)
+      </h3>
+      <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+        {% for m in chat_models %}
+          <label class="lit-pick block cursor-pointer">
+            <input type="checkbox" name="models" value="{{ m.id }}" class="sr-only"
+                   {% if loop.index <= 2 %}checked{% endif %}>
+            <div class="lit-pick__frame h-full rounded-lg border border-slate-200 bg-white p-3
+                        transition hover:border-amber-300 dark:border-slate-800 dark:bg-slate-950">
+              <p class="font-mono text-sm font-medium">{{ m.name }}</p>
+              <p class="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                {{ m.parameter_size }} &middot; {{ m.size }}
+              </p>
+            </div>
+          </label>
+        {% else %}
+          <p class="text-sm text-slate-500 dark:text-slate-400">No local models available.</p>
+        {% endfor %}
+      </div>
+
+      <h3 class="mt-5 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+        Flagship (cloud)
+      </h3>
+      <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+        {% for m in flagship_models %}
+          <label class="lit-pick block {% if m.key_present %}cursor-pointer{% endif %}">
+            <input type="checkbox" name="models" value="{{ m.id }}" class="sr-only"
+                   {% if not m.key_present %}disabled{% endif %}>
+            <div class="lit-pick__frame h-full rounded-lg border border-slate-200 bg-white p-3
+                        dark:border-slate-800 dark:bg-slate-950">
+              <p class="text-sm font-medium">{{ m.label }}</p>
+              <p class="mt-1 text-xs {% if m.key_present %}text-slate-500 dark:text-slate-400
+                                     {% else %}text-red-500{% endif %}">
+                {% if m.key_present %}{{ m.provider }}{% else %}needs {{ m.api_key_env }}{% endif %}
+              </p>
+            </div>
+          </label>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
+      <h2 class="text-lg font-medium">Metrics</h2>
+      <div class="mt-4">{% include "partials/metric_picker.html" %}</div>
+    </section>
+
+    <section class="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
+      <h2 class="text-lg font-medium">Data, judge &amp; execution</h2>
+      <div class="mt-4 grid gap-6 md:grid-cols-2">
+        <div class="space-y-4">
+          {% with scope='cmp' %}{% include "partials/dataset_picker.html" %}{% endwith %}
+          <div>
+            <label for="cmp-name" class="block text-sm font-medium">Name (optional)</label>
+            <input id="cmp-name" type="text" name="name" placeholder="Local 3B vs 14B"
+                   class="mt-2 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm
+                          dark:border-slate-700 dark:bg-slate-950">
+          </div>
+          <fieldset>
+            <legend class="text-sm font-medium">Execution</legend>
+            <label class="mt-2 flex items-start gap-2 text-sm">
+              <input type="radio" name="mode" value="sequential" checked class="mt-1">
+              <span>
+                <span class="font-medium">Sequential</span>
+                <span class="block text-xs text-slate-500 dark:text-slate-400">
+                  One model at a time. The right choice for local models &mdash; running
+                  several at once thrashes memory and is usually slower overall.
+                </span>
+              </span>
+            </label>
+            <label class="mt-2 flex items-start gap-2 text-sm">
+              <input type="radio" name="mode" value="parallel" class="mt-1">
+              <span>
+                <span class="font-medium">Parallel</span>
+                <span class="block text-xs text-slate-500 dark:text-slate-400">
+                  All models at once. Much faster when every model is a cloud model.
+                </span>
+              </span>
+            </label>
+          </fieldset>
+        </div>
+
+        {% with scope='cmp' %}{% include "partials/judge_picker.html" %}{% endwith %}
+      </div>
+    </section>
+
+    <button type="submit"
+            class="rounded-lg bg-amber-500 px-5 py-2.5 text-sm font-semibold text-white shadow-sm
+                   hover:bg-amber-600">Compare</button>
+  </form>
+
+  {% if comparisons %}
+    <section>
+      <h2 class="mb-3 text-lg font-medium">Past comparisons</h2>
+      <div class="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+        {% for c in comparisons %}
+          <a href="/compare/{{ c.id }}"
+             class="rounded-xl border border-slate-200 bg-white p-4 hover:border-amber-300
+                    dark:border-slate-800 dark:bg-slate-900">
+            <div class="flex items-start justify-between gap-2">
+              <p class="text-sm font-medium">{{ c.name or 'Comparison #' ~ c.id }}</p>
+              {% set run = c %}{% include "partials/status_badge.html" %}
+            </div>
+            <p class="mt-2 text-xs text-slate-500 dark:text-slate-400">
+              {{ c.model_ids|length }} models &middot; {{ c.metrics|length }} metrics
+            </p>
+          </a>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+</div>
+{% endblock %}
