@@ -30,6 +30,8 @@ import io
 from dataclasses import dataclass, field
 from typing import Any
 
+import database
+import harness
 import perf
 import scoring
 
@@ -51,6 +53,8 @@ class Row:
     composite: scoring.Composite | None
     metrics: dict[str, float | None] = field(default_factory=dict)
     measured: perf.RunPerf | None = None
+    #: task key -> the latest completed benchmark_runs row for this model.
+    benchmarks: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # -- display helpers ---------------------------------------------------
     @property
@@ -80,6 +84,25 @@ class Row:
     def cost_label(self) -> str:
         return self.measured.cost_label if self.measured else "--"
 
+    def benchmark_label(self, task_key: str) -> str:
+        """A benchmark score with its interval, or a dash.
+
+        The interval travels with the number everywhere it is shown. A bare
+        '62.5%' from eight questions reads as precision it does not have.
+        """
+        row = self.benchmarks.get(task_key)
+        if not row or row.get("score") is None:
+            return "--"
+        percent = row["score"] * 100
+        stderr = row.get("stderr")
+        if stderr is None:
+            return f"{percent:.1f}%"
+        return f"{percent:.1f}% ± {stderr * harness.Z_95 * 100:.1f}"
+
+    def benchmark_samples(self, task_key: str) -> int | None:
+        row = self.benchmarks.get(task_key)
+        return row.get("samples") if row else None
+
     @property
     def served_label(self) -> str:
         parts = [p for p in (self.runtime, self.quantization) if p]
@@ -88,9 +111,12 @@ class Row:
 
 @dataclass
 class Scorecard:
-    """Rows plus the metric columns they span."""
+    """Rows plus the metric and benchmark columns they span."""
     rows: list[Row] = field(default_factory=list)
     metric_labels: list[str] = field(default_factory=list)
+    #: Benchmark tasks any row actually has a score for -- an empty column for
+    #: a task nobody has run is noise, not information.
+    benchmark_tasks: list[harness.Task] = field(default_factory=list)
 
     @property
     def setup_groups(self) -> dict[str, list[Row]]:
@@ -123,6 +149,12 @@ def build(runs: list[dict[str, Any]]) -> Scorecard:
     rows: list[Row] = []
     labels: list[str] = []
 
+    # Benchmarks attach per *model*, not per eval run: a GSM8K score is a
+    # property of the weights, and re-running the judge-based eval doesn't
+    # change it. Cached per model id so a table of thirty runs across four
+    # models makes four queries rather than thirty.
+    bench_cache: dict[str, dict[str, dict[str, Any]]] = {}
+
     for run in runs:
         summary = run.get("summary") or []
         if not summary:
@@ -154,13 +186,27 @@ def build(runs: list[dict[str, Any]]) -> Scorecard:
             composite=scoring.composite(summary),
             metrics=per_metric,
             measured=perf.from_run(run),
+            benchmarks=_benchmarks_for(run.get("model_id") or "", bench_cache),
         ))
 
     # Best first, but only within what is measurable: unscored rows sink rather
     # than being treated as a zero they never earned.
     rows.sort(key=lambda r: (r.score is None, -(r.score or 0.0)))
     labels.sort()
-    return Scorecard(rows=rows, metric_labels=labels)
+
+    scored_tasks = {key for row in rows for key in row.benchmarks}
+    tasks = [t for t in harness.TASKS if t.key in scored_tasks]
+    return Scorecard(rows=rows, metric_labels=labels, benchmark_tasks=tasks)
+
+
+def _benchmarks_for(
+    model_id: str, cache: dict[str, dict[str, dict[str, Any]]]
+) -> dict[str, dict[str, Any]]:
+    if not model_id:
+        return {}
+    if model_id not in cache:
+        cache[model_id] = database.latest_benchmark_scores(model_id)
+    return cache[model_id]
 
 
 HEADERS = [
@@ -184,7 +230,10 @@ def to_csv(card: Scorecard) -> str:
     """
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(HEADERS + card.metric_labels + TAIL_HEADERS)
+    bench_cols: list[str] = []
+    for task in card.benchmark_tasks:
+        bench_cols += [f"{task.key}_percent", f"{task.key}_margin95", f"{task.key}_samples"]
+    writer.writerow(HEADERS + card.metric_labels + bench_cols + TAIL_HEADERS)
 
     for row in card.rows:
         measured = row.measured
@@ -200,6 +249,7 @@ def to_csv(card: Scorecard) -> str:
                 "" if row.metrics.get(label) is None else round(row.metrics[label], 4)
                 for label in card.metric_labels
             ]
+            + _benchmark_cells(row, card.benchmark_tasks)
             + [
                 _num(measured.ttft_p50) if measured else "",
                 _num(measured.ttft_p90) if measured else "",
@@ -213,6 +263,23 @@ def to_csv(card: Scorecard) -> str:
             ]
         )
     return buf.getvalue()
+
+
+def _benchmark_cells(row: Row, tasks: list[harness.Task]) -> list[Any]:
+    """Score, interval and sample count per task -- flat, numeric, sortable."""
+    cells: list[Any] = []
+    for task in tasks:
+        entry = row.benchmarks.get(task.key)
+        if not entry or entry.get("score") is None:
+            cells += ["", "", ""]
+            continue
+        stderr = entry.get("stderr")
+        cells += [
+            round(entry["score"] * 100, 2),
+            round(stderr * harness.Z_95 * 100, 2) if stderr is not None else "",
+            entry.get("samples") or "",
+        ]
+    return cells
 
 
 def _num(value: float | None) -> str | float:

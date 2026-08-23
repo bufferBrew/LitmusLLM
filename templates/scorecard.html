@@ -34,7 +34,7 @@
     </div>
 
     <div class="overflow-x-auto rounded-xl border border-slate-200 dark:border-slate-800">
-      <table class="min-w-[76rem] w-full text-left text-sm">
+      <table class="min-w-[88rem] w-full text-left text-sm">
         <thead class="bg-slate-50 text-xs uppercase tracking-wide text-slate-500
                       dark:bg-slate-900 dark:text-slate-400">
           <tr>
@@ -47,6 +47,12 @@
             </th>
             {% for label in card.metric_labels %}
               <th class="px-3 py-3 font-medium">{{ label }}</th>
+            {% endfor %}
+            {% for task in card.benchmark_tasks %}
+              <th class="px-3 py-3 font-medium text-sky-700 dark:text-sky-300"
+                  title="{{ task.blurb }} Ground-truth accuracy, not a judge score.">
+                {{ task.label }}
+              </th>
             {% endfor %}
             <th class="px-3 py-3 font-medium" title="Median output tokens per second">tok/s</th>
             <th class="px-3 py-3 font-medium" title="Median time to first token">TTFT</th>
@@ -90,6 +96,18 @@
                   {% if value is not none %}{{ value|score }}{% else %}<span class="text-slate-400">--</span>{% endif %}
                 </td>
               {% endfor %}
+              {# Benchmarks are tinted differently because they are a different
+                 kind of number: accuracy against known answers, on a scale
+                 other people's published figures also use. #}
+              {% for task in card.benchmark_tasks %}
+                <td class="px-3 py-3 text-xs tabular-nums text-sky-700 dark:text-sky-300">
+                  {{ row.benchmark_label(task.key) }}
+                  {% set n = row.benchmark_samples(task.key) %}
+                  {% if n %}
+                    <span class="block text-[10px] text-slate-400">{{ n }} items</span>
+                  {% endif %}
+                </td>
+              {% endfor %}
               <td class="px-3 py-3 text-xs tabular-nums">{{ row.tps_label }}</td>
               <td class="px-3 py-3 text-xs tabular-nums">{{ row.ttft_label }}</td>
               <td class="px-3 py-3 text-xs tabular-nums">{{ row.vram_label }}</td>
@@ -104,6 +122,10 @@
     </div>
 
     <p class="text-xs leading-relaxed text-slate-500 dark:text-slate-400">
+      Benchmark columns (tinted) are ground-truth accuracy from lm-evaluation-harness, shown with a
+      95% interval &mdash; two models whose intervals overlap are tied, however different the
+      headline numbers look. They attach to the model, not the run, so re-running an eval does not
+      change them. Everything else is judge-scored and compares only within a matching setup tag.
       Speed and memory are measured on the model under test only &mdash; the judge is never timed.
       For local models these numbers describe <em>this machine</em>, not the model: the same weights
       on other hardware give different figures, and they do not line up with a hosted provider's

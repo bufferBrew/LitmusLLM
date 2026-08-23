@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Benchmarks &middot; LitmusLLM{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+  <header>
+    <h1 class="text-2xl font-semibold tracking-tight">Benchmarks</h1>
+    <p class="mt-1 max-w-3xl text-sm text-slate-600 dark:text-slate-400">
+      Fixed question sets with known answers, scored by
+      <a href="https://github.com/EleutherAI/lm-evaluation-harness" target="_blank"
+         rel="noopener noreferrer" class="underline decoration-dotted underline-offset-2">lm-evaluation-harness</a>.
+      This is the one measurement here that shares a scale with figures other people publish.
+    </p>
+  </header>
+
+  {# The distinction the whole app rests on, restated where someone is about to
+     blur it. A benchmark percentage and a Litmus Score are not two views of one
+     quantity, and the Reference page makes the same argument at length. #}
+  <div class="rounded-lg border border-sky-200 bg-sky-50 p-4 text-sm leading-relaxed
+              text-sky-900 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-200">
+    <p class="font-semibold">This is not the Litmus Score, and the two never mix</p>
+    <p class="mt-1">
+      A <strong>Litmus Score</strong> is a judge model&rsquo;s opinion of <em>your</em> prompts, on
+      your scale. A <strong>benchmark score</strong> is accuracy against answers everyone can check,
+      on everyone&rsquo;s scale. Only the second can be read against a published figure &mdash; and
+      even then, expect the same ballpark rather than the same decimal: prompt templates, answer
+      extraction and shot counts all move a score by points.
+    </p>
+    <p class="mt-2">
+      The check worth doing first: benchmark a model whose published number you already know. If you
+      land inside its interval, the harness is wired correctly. If you land eight points low, your
+      setup is off &mdash; not the model.
+    </p>
+  </div>
+
+  <section class="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
+    <h2 class="text-lg font-medium">Run a benchmark</h2>
+    <div class="mt-4">
+      {% include "partials/benchmark_picker.html" %}
+    </div>
+  </section>
+
+  <section>
+    <div class="mb-3 flex flex-wrap items-end justify-between gap-3">
+      <h2 class="text-lg font-medium">Results</h2>
+      <p class="text-xs text-slate-500 dark:text-slate-400">
+        Scores carry a 95% interval. Overlapping intervals mean the models are tied, however
+        different the headline numbers look.
+      </p>
+    </div>
+    {% include "partials/benchmark_runs.html" %}
+  </section>
+</div>
+{% endblock %}

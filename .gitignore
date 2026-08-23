@@ -8,5 +8,9 @@ data/*.db-wal
 data/*.db-shm
 data/uploads/*
 !data/uploads/.gitkeep
+# lm-eval writes results and per-sample dumps here; the scores that matter
+# are copied into SQLite, and the raw dumps get large fast.
+data/benchmarks/
+data/deepeval/
 .DS_Store
 graphify-out/

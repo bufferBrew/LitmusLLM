@@ -36,6 +36,7 @@ import database
 from database import utcnow
 from llm_clients import JudgeModel, ModelCallError, TargetModel
 from metrics_catalog import MetricSpec, get_metric, missing_requirements, resolve_metrics
+import harness
 import perf
 import runtimes
 from model_registry import ModelSpec, parse_model_id
@@ -703,3 +704,177 @@ async def shutdown() -> None:
         task.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# Ground-truth benchmark runs
+# ---------------------------------------------------------------------------
+# Same job/cancel shape as an eval run, but the work happens in a subprocess,
+# so stopping is a kill rather than a cooperative flag -- see harness.run_task.
+
+_benchmark_jobs: dict[int, Job] = {}
+
+
+def benchmark_is_running(run_id: int) -> bool:
+    return run_id in _benchmark_jobs
+
+
+def request_benchmark_stop(run_id: int) -> bool:
+    job = _benchmark_jobs.get(run_id)
+    if not job:
+        return False
+    job.cancel.set()
+    return True
+
+
+async def _execute_benchmark(
+    run_id: int,
+    task: harness.Task,
+    model_spec: ModelSpec,
+    *,
+    limit: int | None,
+    num_fewshot: int | None,
+    cancel: asyncio.Event,
+) -> str:
+    database.update_benchmark_run(
+        run_id, status="running", progress_note=f"Starting {task.label}"
+    )
+
+    await runtimes.ensure_running(runtimes.get(model_spec.runtime))
+
+    # Recorded now, not at export: a benchmark score belongs to the weights
+    # that produced it, and re-pulling a model at a different quantization
+    # would otherwise silently relabel history.
+    quantization = await runtimes.quantization_for(model_spec.runtime, model_spec.name)
+    if quantization:
+        database.update_benchmark_run(run_id, quantization=quantization)
+
+    def note(text: str) -> None:
+        database.update_benchmark_run(run_id, progress_note=text)
+
+    outcome = await harness.run_task(
+        task,
+        base_url=model_spec.base_url or "",
+        model_name=model_spec.name,
+        output_dir=harness.RESULTS_DIR / f"run-{run_id}",
+        limit=limit,
+        num_fewshot=num_fewshot,
+        on_progress=note,
+        cancel=cancel,
+    )
+
+    database.update_benchmark_run(
+        run_id,
+        command=json.dumps(outcome.command),
+        log_tail=outcome.log_tail or None,
+    )
+
+    if not outcome.ok or outcome.result is None:
+        if cancel.is_set():
+            database.update_benchmark_run(run_id, error=outcome.error)
+            return "stopped"
+        database.update_benchmark_run(run_id, error=outcome.error or "Unknown failure.")
+        return "failed"
+
+    result = outcome.result
+    database.update_benchmark_run(
+        run_id,
+        metric_name=result.metric_key,
+        score=result.score,
+        stderr=result.stderr,
+        samples=result.samples,
+        num_fewshot=result.num_fewshot,
+        raw_json=json.dumps(result.raw),
+        progress_note=harness.calibration_hint(task, result),
+    )
+    return "completed"
+
+
+async def _benchmark_wrapper(
+    run_id: int,
+    task: harness.Task,
+    model_spec: ModelSpec,
+    limit: int | None,
+    num_fewshot: int | None,
+    cancel: asyncio.Event,
+) -> str:
+    """Own the terminal state of a benchmark run: always writes a final status."""
+    status = "failed"
+    error: str | None = None
+    try:
+        status = await _execute_benchmark(
+            run_id, task, model_spec,
+            limit=limit, num_fewshot=num_fewshot, cancel=cancel,
+        )
+    except asyncio.CancelledError:
+        database.update_benchmark_run(
+            run_id, status="stopped", completed_at=utcnow(),
+            progress_note="Stopped",
+        )
+        _benchmark_jobs.pop(run_id, None)
+        raise
+    except (harness.HarnessUnavailable, runtimes.RuntimeUnavailable) as exc:
+        error = str(exc)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
+        log.exception("benchmark run %s failed", run_id)
+        error = str(exc)
+    finally:
+        if not cancel.is_set() or status != "stopped":
+            notes = {"completed": None, "stopped": "Stopped", "failed": "Failed"}
+            fields: dict[str, Any] = {
+                "status": status, "completed_at": utcnow(),
+            }
+            if error is not None:
+                fields["error"] = error
+            if notes.get(status):
+                fields["progress_note"] = notes[status]
+            database.update_benchmark_run(run_id, **fields)
+        _benchmark_jobs.pop(run_id, None)
+    return status
+
+
+def start_benchmark_run(
+    *,
+    model_id: str,
+    task_key: str,
+    limit: int | None = None,
+    num_fewshot: int | None = None,
+    allow_code_execution: bool = False,
+) -> int:
+    """Create a benchmark run and execute it in the background.
+
+    Refuses cloud models outright rather than failing deep inside lm-eval:
+    benchmarking one would need a LiteLLM proxy for the harness to talk to,
+    which does not exist yet, and a clear no beats a confusing stack trace.
+    """
+    task = harness.get_task(task_key)
+    model_spec = parse_model_id(model_id)
+
+    if model_spec.kind != "local":
+        raise ValueError(
+            "Benchmarks currently run against local runtimes only. Reaching a cloud "
+            "model would need a LiteLLM proxy for lm-eval to talk to."
+        )
+    if task.needs_code_execution and not allow_code_execution:
+        raise ValueError(
+            f"{task.label} is scored by executing code the model wrote. Tick the "
+            f"code-execution box to run it."
+        )
+
+    run_id = database.create_benchmark_run(
+        model_name=model_spec.label,
+        model_id=model_spec.id,
+        task=task.key,
+        task_label=task.label,
+        runtime=model_spec.runtime,
+        item_limit=limit,
+        num_fewshot=num_fewshot if num_fewshot is not None else task.num_fewshot,
+    )
+
+    job = Job()
+    _benchmark_jobs[run_id] = job
+    job.task = asyncio.create_task(
+        _benchmark_wrapper(run_id, task, model_spec, limit, num_fewshot, job.cancel),
+        name=f"litmusllm-benchmark-{run_id}",
+    )
+    return run_id

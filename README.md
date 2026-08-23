@@ -244,6 +244,65 @@ anything outside your laptop:
 3. **Cost is blank for local runs because there is no invoice**, not because
    inference is free.
 
+## Ground-truth benchmarks
+
+`/benchmarks` runs fixed question sets with known answers through
+[lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness).
+This is the **only** number in the app that shares a scale with figures other
+people publish — everything else is a judge's opinion of your prompts.
+
+| Task | What it measures | Shape |
+|---|---|---|
+| GSM8K | multi-step grade-school maths | generative |
+| IFEval | checkable instruction constraints, scored by a program | generative |
+| HellaSwag | commonsense sentence completion | log-likelihood |
+| ARC Challenge | grade-school science | log-likelihood |
+| HumanEval | Python completion, `pass@1` | generative + code execution |
+
+It is **optional**: `pip install 'lm-eval[api,ifeval]'`. That pulls torch, a
+couple of gigabytes, which is why it isn't in `requirements.txt` — the rest of
+the app runs fine without it and says so instead of failing.
+
+### Ollama can't run the multiple-choice tasks
+
+Log-likelihood tasks work by asking the model to score each candidate answer,
+which needs token logprobs from the API. **Ollama returns none**, on either of
+its OpenAI-compatible endpoints. llama.cpp and LM Studio do. So HellaSwag and
+ARC are greyed out with an explanation when you pick an Ollama model, rather
+than failing two minutes into a run — and running the same weights under
+llama.cpp is the workaround. This is the clearest practical payoff of the
+multi-runtime work.
+
+### Read the interval, not the number
+
+Every score carries a 95% confidence interval, and the UI shows it everywhere
+the score appears. At 50 items the interval is roughly ±14 points; two models
+inside each other's intervals are **tied**, however different the headline
+numbers look. Public leaderboards mostly hide this. Raising the item count is
+the only thing that narrows it.
+
+### Calibrate before you believe it
+
+No homegrown harness reproduces a published figure exactly — prompt templates,
+answer extraction and shot counts each move a score by points. So run a model
+whose public number you already know first. Land inside its interval and the
+setup is sound; land eight points low and your extraction is broken, not the
+model. Those two look identical if you skip the check.
+
+Each run stores the exact `lm_eval` argv it used, so any result can be
+reproduced outside the app.
+
+### HumanEval executes code the model wrote
+
+It is scored by running model-generated Python, unsandboxed, in this process.
+That is off unless you tick the box, the box is per-run and never remembered,
+and `HF_ALLOW_CODE_EVAL` is only ever set for that one task.
+
+### Not yet covered
+
+Cloud models. Reaching one would mean standing up a LiteLLM proxy for lm-eval
+to talk to; the picker says so rather than offering an option that fails.
+
 ## The Scorecard
 
 `/scorecard` puts every run in one table — Litmus Score, per-metric averages,
@@ -502,6 +561,7 @@ LitmusLLM/
 ├── scoring.py              # the Litmus Score composite + comparability tags
 ├── perf.py                 # TTFT / throughput / token / cost measurement
 ├── scorecard.py            # the cross-run comparison table and its CSV
+├── harness.py              # lm-eval driver: task catalogue, capability probe, subprocess
 ├── datasets.py             # built-in dataset, CSV parsing
 ├── benchmarks.py           # published third-party reference figures + provenance
 ├── database.py             # SQLite schema and queries

@@ -118,6 +118,35 @@ CREATE TABLE IF NOT EXISTS comparison_results (
     rank              INTEGER
 );
 
+-- Ground-truth benchmark runs: accuracy against a fixed question set with
+-- known answers, measured here by lm-evaluation-harness. Kept apart from
+-- eval_runs because it is a different measurement -- a percentage on
+-- everyone's scale, not a judge's opinion on yours -- and apart from
+-- benchmark_reference because these we measured and those we merely quote.
+CREATE TABLE IF NOT EXISTS benchmark_runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_name    TEXT    NOT NULL,
+    model_id      TEXT    NOT NULL,
+    runtime       TEXT,
+    quantization  TEXT,
+    task          TEXT    NOT NULL,      -- lm-eval task key, e.g. 'gsm8k'
+    task_label    TEXT    NOT NULL,
+    metric_name   TEXT,                  -- which of the task's metrics was read
+    score         REAL,                  -- 0-1
+    stderr        REAL,                  -- standard error, for the 95% interval
+    samples       INTEGER NOT NULL DEFAULT 0,
+    item_limit    INTEGER,               -- NULL means the full set
+    num_fewshot   INTEGER,
+    status        TEXT    NOT NULL,      -- queued|running|completed|stopped|failed
+    progress_note TEXT,
+    error         TEXT,
+    command       TEXT,                  -- the argv, so a result can be reproduced
+    log_tail      TEXT,
+    raw_json      TEXT,
+    started_at    TIMESTAMP,
+    completed_at  TIMESTAMP
+);
+
 -- Published benchmark figures measured by third parties, NOT by LitmusLLM.
 -- Kept in its own table (and its own UI panel) precisely so it can never be
 -- confused with, or averaged into, a measured eval score.
@@ -138,6 +167,7 @@ CREATE TABLE IF NOT EXISTS benchmark_reference (
 );
 
 CREATE INDEX IF NOT EXISTS idx_bench_family ON benchmark_reference(family);
+CREATE INDEX IF NOT EXISTS idx_bench_runs    ON benchmark_runs(model_id, task);
 CREATE INDEX IF NOT EXISTS idx_results_run   ON eval_results(eval_run_id);
 CREATE INDEX IF NOT EXISTS idx_rows_dataset  ON dataset_rows(dataset_id, row_index);
 CREATE INDEX IF NOT EXISTS idx_runs_cmp      ON eval_runs(comparison_run_id);
@@ -334,6 +364,17 @@ def reap_interrupted_runs() -> int:
             """UPDATE comparison_runs
                   SET status='failed',
                       error=COALESCE(error, 'Interrupted -- the app restarted mid-run.'),
+                      completed_at=?
+                WHERE status IN ('running','queued')""",
+            (utcnow(),),
+        )
+        # Benchmark runs live in a subprocess, which dies with its parent, so a
+        # row still claiming to be running after a restart is just as stale.
+        conn.execute(
+            """UPDATE benchmark_runs
+                  SET status='failed',
+                      error=COALESCE(error, 'Interrupted -- the app restarted mid-run.'),
+                      progress_note='Interrupted',
                       completed_at=?
                 WHERE status IN ('running','queued')""",
             (utcnow(),),
@@ -758,3 +799,96 @@ def list_benchmark_rows(family: str | None = None) -> list[dict[str, Any]]:
 def delete_benchmark_row(row_id: int) -> None:
     with get_conn() as conn:
         conn.execute("DELETE FROM benchmark_reference WHERE id=?", (row_id,))
+
+
+# --------------------------------------------------------------------------
+# Benchmark runs
+# --------------------------------------------------------------------------
+
+def create_benchmark_run(
+    *,
+    model_name: str,
+    model_id: str,
+    task: str,
+    task_label: str,
+    runtime: str | None = None,
+    quantization: str | None = None,
+    item_limit: int | None = None,
+    num_fewshot: int | None = None,
+) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO benchmark_runs
+                 (model_name, model_id, runtime, quantization, task, task_label,
+                  item_limit, num_fewshot, status, progress_note, started_at)
+               VALUES (?,?,?,?,?,?,?,?,'queued',?,?)""",
+            (
+                model_name, model_id, runtime, quantization, task, task_label,
+                item_limit, num_fewshot, "Queued", utcnow(),
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def update_benchmark_run(run_id: int, **fields: Any) -> None:
+    """Patch a benchmark run. Unknown keys are rejected loudly."""
+    allowed = {
+        "status", "progress_note", "error", "completed_at", "metric_name",
+        "score", "stderr", "samples", "command", "log_tail", "raw_json",
+        "num_fewshot", "item_limit", "runtime", "quantization",
+    }
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(f"update_benchmark_run: unknown column(s) {sorted(unknown)}")
+    if not fields:
+        return
+    assignments = ", ".join(f"{k}=?" for k in fields)
+    with get_conn() as conn:
+        conn.execute(
+            f"UPDATE benchmark_runs SET {assignments} WHERE id=?",
+            (*fields.values(), run_id),
+        )
+
+
+def get_benchmark_run(run_id: int) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM benchmark_runs WHERE id=?", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def list_benchmark_runs(limit: int = 200, *, model_id: str | None = None) -> list[dict[str, Any]]:
+    query = "SELECT * FROM benchmark_runs"
+    params: list[Any] = []
+    if model_id:
+        query += " WHERE model_id=?"
+        params.append(model_id)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute(query, params)]
+
+
+def delete_benchmark_run(run_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM benchmark_runs WHERE id=?", (run_id,))
+
+
+def latest_benchmark_scores(model_id: str) -> dict[str, dict[str, Any]]:
+    """The most recent completed score per task for one model.
+
+    Newest-wins rather than best-wins: a benchmark re-run after a model is
+    re-pulled at a different quantization describes the model you have now, and
+    keeping the older, higher score would be flattering rather than accurate.
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM benchmark_runs
+                WHERE model_id=? AND status='completed' AND score IS NOT NULL
+                ORDER BY id DESC""",
+            (model_id,),
+        ).fetchall()
+    latest: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        entry = dict(row)
+        latest.setdefault(entry["task"], entry)
+    return latest

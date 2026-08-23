@@ -30,6 +30,7 @@ import benchmarks
 import database
 import datasets as datasets_mod
 import eval_runner
+import harness
 import metrics_catalog
 import model_registry
 import perf
@@ -1008,6 +1009,143 @@ def _reference_view(highlight_families: list[str] | None = None) -> dict[str, An
             "highlighted": [bool(r["family"] in highlight) for r in rows[:24]],
         }),
     }
+
+
+async def _benchmark_context(model_id: str | None = None) -> dict[str, Any]:
+    """Everything the benchmarks page needs, including what it *can't* run."""
+    options = await model_options()
+    chosen = model_id or (options["chat_models"][0]["id"] if options["chat_models"] else None)
+
+    available = None
+    if chosen:
+        spec = model_registry.parse_model_id(chosen)
+        if spec.kind == "local":
+            available = await harness.availability(spec.runtime, spec.name)
+
+    runs = database.list_benchmark_runs(limit=100)
+    return {
+        **options,
+        "tasks": harness.TASKS,
+        "selected_model": chosen,
+        "availability": available.as_dict() if available else None,
+        "harness_installed": harness.harness_installed() is not None,
+        "runs": runs,
+        # Without this the results table renders without its poller, so loading
+        # the page while a benchmark is live would show a frozen progress note
+        # until the user refreshed by hand.
+        "any_running": any(eval_runner.benchmark_is_running(r["id"]) for r in runs),
+    }
+
+
+@app.get("/benchmarks", response_class=HTMLResponse)
+async def page_benchmarks(request: Request, model: str | None = None):
+    """Ground-truth benchmarks: accuracy against known answers, not a judge."""
+    return render(
+        request, "benchmarks.html", active="benchmarks",
+        **await _benchmark_context(model),
+    )
+
+
+@app.get("/ui/benchmark-runs", response_class=HTMLResponse)
+async def ui_benchmark_runs(request: Request):
+    """Polled while a benchmark is live so progress and results appear."""
+    runs = database.list_benchmark_runs(limit=100)
+    return render(
+        request, "partials/benchmark_runs.html",
+        runs=runs,
+        any_running=any(eval_runner.benchmark_is_running(r["id"]) for r in runs),
+    )
+
+
+@app.get("/ui/benchmark-picker", response_class=HTMLResponse)
+async def ui_benchmark_picker(request: Request, model: str | None = None):
+    """Re-rendered when the model changes: availability is model-specific."""
+    return render(
+        request, "partials/benchmark_picker.html", **await _benchmark_context(model)
+    )
+
+
+@app.post("/api/benchmarks")
+async def api_start_benchmark(
+    request: Request,
+    model: str = Form(...),
+    task: str = Form(...),
+    limit: str = Form(""),
+    allow_code_execution: str = Form(""),
+):
+    """Start one benchmark run in the background."""
+    raw_limit = (limit or "").strip()
+    try:
+        item_limit = int(raw_limit) if raw_limit else None
+    except ValueError:
+        raise HTTPException(400, f"'{raw_limit}' is not a whole number of items.") from None
+    if item_limit is not None and item_limit < 1:
+        raise HTTPException(400, "The item limit must be at least 1.")
+
+    try:
+        run_id = eval_runner.start_benchmark_run(
+            model_id=model.strip(),
+            task_key=task.strip(),
+            limit=item_limit,
+            allow_code_execution=bool(allow_code_execution),
+        )
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    if "text/html" in request.headers.get("accept", ""):
+        return RedirectResponse("/benchmarks", status_code=303)
+    return {"id": run_id, "status": "queued"}
+
+
+@app.post("/api/benchmarks/{run_id}/stop")
+async def api_stop_benchmark(request: Request, run_id: int):
+    """Kill the harness subprocess. Nothing partial is kept -- lm-eval only
+    reports a score once every item is done."""
+    if not database.get_benchmark_run(run_id):
+        raise HTTPException(404, "No such benchmark run.")
+    stopped = eval_runner.request_benchmark_stop(run_id)
+    if "text/html" in request.headers.get("accept", ""):
+        return RedirectResponse("/benchmarks", status_code=303)
+    return {"id": run_id, "stopping": stopped}
+
+
+@app.post("/api/benchmarks/{run_id}/delete")
+async def api_delete_benchmark(run_id: int):
+    if not database.get_benchmark_run(run_id):
+        raise HTTPException(404, "No such benchmark run.")
+    eval_runner.request_benchmark_stop(run_id)
+    database.delete_benchmark_run(run_id)
+    return RedirectResponse("/benchmarks", status_code=303)
+
+
+@app.get("/api/benchmarks")
+async def api_list_benchmarks(limit: int = 200, model: str | None = None):
+    return {"runs": database.list_benchmark_runs(limit=limit, model_id=model)}
+
+
+@app.get("/api/benchmarks/tasks")
+async def api_benchmark_tasks(model: str | None = None):
+    """The task catalogue, annotated with what this model can actually run."""
+    payload: dict[str, Any] = {
+        "harness_installed": harness.harness_installed() is not None,
+        "tasks": [
+            {
+                "key": t.key, "label": t.label, "blurb": t.blurb, "kind": t.kind,
+                "metric": t.metric_label, "items": t.items,
+                "default_limit": t.default_limit, "num_fewshot": t.num_fewshot,
+                "needs_code_execution": t.needs_code_execution,
+                "contamination": t.contamination, "source_url": t.source_url,
+            }
+            for t in harness.TASKS
+        ],
+    }
+    if model:
+        spec = model_registry.parse_model_id(model)
+        if spec.kind == "local":
+            payload["availability"] = (
+                await harness.availability(spec.runtime, spec.name)
+            ).as_dict()
+    return payload
 
 
 @app.get("/scorecard", response_class=HTMLResponse)
