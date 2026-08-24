@@ -19,3 +19,14 @@ litellm>=1.55.0
 
 # Pinned transitively by both of the above, but declared because we use it directly.
 pydantic>=2.7.0
+
+# --- Ground-truth benchmarks (optional) ---
+# Only needed for the /benchmarks page. It pulls torch and transformers, which
+# is a couple of gigabytes -- the rest of the app runs fine without it, and
+# says so rather than failing, so this stays optional on purpose.
+#
+#   pip install 'lm-eval[api,ifeval]'
+#
+# lm-eval[api]     -- the local-completions backends this app drives
+# lm-eval[ifeval]  -- langdetect/immutabledict, required by IFEval only
+# lm-eval>=0.4.5

@@ -1,14 +1,21 @@
 {# Polled by the dashboard every 3s so live runs advance without a reload. #}
 {% if runs %}
   <div class="overflow-x-auto rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900">
-    <table class="w-full min-w-[52rem] text-sm">
+    <table class="w-full min-w-[70rem] text-sm">
       <thead class="border-b border-slate-200 text-left text-xs uppercase tracking-wide
                     text-slate-500 dark:border-slate-800 dark:text-slate-400">
         <tr>
           <th class="px-4 py-3 font-medium">Run</th>
           <th class="px-4 py-3 font-medium">Model</th>
           <th class="px-4 py-3 font-medium">Dataset</th>
+          <th class="px-4 py-3 font-medium" title="Mean of the run's metric averages, 0-100">
+            Litmus Score
+          </th>
           <th class="px-4 py-3 font-medium">Scores</th>
+          <th class="px-4 py-3 font-medium"
+              title="Median output speed and time to first token for the model under test">
+            Speed
+          </th>
           <th class="px-4 py-3 font-medium">Progress</th>
           <th class="px-4 py-3 font-medium">Started</th>
           <th class="px-4 py-3 font-medium">Status</th>
@@ -28,8 +35,36 @@
             <td class="px-4 py-3">
               <span class="font-mono text-xs">{{ run.model_name }}</span>
               <span class="ml-1 text-[10px] uppercase text-slate-400">{{ run.model_type }}</span>
+              {% if run.runtime or run.quantization %}
+                <span class="block text-[10px] text-slate-400 dark:text-slate-500">
+                  {{ run.runtime or '' }}{% if run.runtime and run.quantization %} &middot; {% endif %}
+                  {{- run.quantization or '' }}
+                </span>
+              {% endif %}
             </td>
             <td class="px-4 py-3 text-xs text-slate-600 dark:text-slate-400">{{ run.dataset_name or '--' }}</td>
+            {# The composite, with the setup tag beside it. Two rows can only be
+               ranked against each other when their tags match -- showing the tag
+               in the column makes that checkable at a glance instead of asking
+               the reader to remember which run used which judge. #}
+            <td class="px-4 py-3">
+              {% set comp = litmus_score(run.summary) %}
+              {% if comp %}
+                {% set band = {'strong': 'emerald', 'fair': 'lime', 'weak': 'amber', 'poor': 'red'}[comp.band] %}
+                <div class="flex items-baseline gap-1.5">
+                  <span class="text-lg font-semibold tabular-nums text-{{ band }}-600 dark:text-{{ band }}-400">
+                    {{ '%.1f'|format(comp.score) }}
+                  </span>
+                  {% if comp.thin %}
+                    <span class="text-amber-500" title="Thin evidence: {{ comp.caveat }}">!</span>
+                  {% endif %}
+                </div>
+                <span class="font-mono text-[10px] text-slate-400"
+                      title="{{ comparability_note(run) }}">{{ comparability_tag(run) }}</span>
+              {% else %}
+                <span class="text-xs text-slate-400">--</span>
+              {% endif %}
+            </td>
             <td class="px-4 py-3">
               {% if run.summary %}
                 <div class="flex flex-wrap gap-1">
@@ -43,6 +78,20 @@
                     </span>
                   {% endfor %}
                 </div>
+              {% else %}
+                <span class="text-xs text-slate-400">--</span>
+              {% endif %}
+            </td>
+            {# Speed, for runs that were instrumented. Older runs show a dash
+               rather than a zero: nobody measured them, which is not the same
+               as them being infinitely slow. #}
+            <td class="px-4 py-3">
+              {% set p = run_perf(run) %}
+              {% if p and p.measured %}
+                <span class="text-xs font-medium tabular-nums">{{ p.tps_label }}</span>
+                <span class="block text-[10px] text-slate-400 dark:text-slate-500">
+                  {{ p.ttft_label }} to first token
+                </span>
               {% else %}
                 <span class="text-xs text-slate-400">--</span>
               {% endif %}

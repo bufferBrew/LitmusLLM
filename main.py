@@ -30,11 +30,16 @@ import benchmarks
 import database
 import datasets as datasets_mod
 import eval_runner
+import harness
 import metrics_catalog
 import model_registry
+import perf
+import runtimes
+import scorecard as scorecard_mod
+import scoring
 from config import DEFAULT_JUDGE, PROJECT_ROOT, UPLOAD_DIR
 from database import utcnow
-from model_registry import OllamaUnavailable
+from runtimes import RuntimeUnavailable
 
 logging.basicConfig(
     level=logging.INFO,
@@ -94,6 +99,22 @@ templates.env.globals["metric_by_label"] = lambda label: next(
     (m for m in metrics_catalog.METRICS if m.label == label), None
 )
 
+# The Litmus Score and its comparability tag are derived, never stored: they
+# fall straight out of the summary rows, so there is no second copy to drift
+# out of step with the results table. See scoring.py for what the number means
+# -- and, more importantly, what it does not.
+templates.env.globals["litmus_score"] = scoring.composite
+templates.env.globals["comparability_tag"] = lambda run: scoring.comparability_key(
+    run.get("dataset_id"), run.get("metrics"), run.get("judge_model")
+)
+templates.env.globals["comparability_note"] = scoring.comparability_note
+# Which local runtime is "the" one, so the compact warning knows whose absence
+# is worth interrupting the user about.
+templates.env.globals["default_runtime"] = config.DEFAULT_RUNTIME
+# Speed measurements are read back the same way the Litmus Score is:
+# derived from the stored row at render time, never a second copy.
+templates.env.globals["run_perf"] = perf.from_run
+
 
 def render(request: Request, name: str, **ctx: Any) -> HTMLResponse:
     """Render a template with the globals every page needs."""
@@ -102,20 +123,32 @@ def render(request: Request, name: str, **ctx: Any) -> HTMLResponse:
 
 
 async def model_options() -> dict[str, Any]:
-    """Local + cloud models for the pickers, plus any Ollama error to show."""
+    """Local + cloud models for the pickers, plus per-runtime health.
+
+    Nothing here raises. With three local runtimes, one being down is the
+    normal case, not a failure -- the picker still needs to render the other
+    two, and the status strip is what explains the gap.
+    """
     local: list[dict[str, Any]] = []
-    ollama_error: str | None = None
+    statuses: list[runtimes.RuntimeStatus] = []
+    runtime_error: str | None = None
     try:
-        local = await model_registry.list_local_models()
-    except OllamaUnavailable as exc:
-        ollama_error = str(exc)
-    except Exception as exc:  # noqa: BLE001
-        ollama_error = f"Could not list Ollama models: {exc}"
+        local, statuses = await runtimes.all_local_models()
+    except Exception as exc:  # noqa: BLE001 - the page is useful without any runtime
+        runtime_error = f"Could not list local models: {exc}"
+
     return {
         "local_models": local,
         "chat_models": [m for m in local if m["chat_capable"]],
         "flagship_models": model_registry.flagship_model_cards(),
-        "ollama_error": ollama_error,
+        "runtime_statuses": [st.as_dict() for st in statuses],
+        "runtime_error": runtime_error,
+        # Retained so any template still checking it keeps working; it now
+        # reports the default runtime specifically, not "local" in general.
+        "ollama_error": next(
+            (st.error for st in statuses if st.key == config.DEFAULT_RUNTIME and st.error),
+            runtime_error,
+        ),
     }
 
 
@@ -138,6 +171,65 @@ def _group_cases(run_id: int) -> list[dict[str, Any]]:
             case["actual_output"] = r["actual_output"]
         case["metrics"].append(r)
     return [cases[k] for k in sorted(cases)]
+
+
+def _perf_payload(run: dict[str, Any]) -> dict[str, Any] | None:
+    """Measured speed/token/cost figures for a run, or None if uninstrumented.
+
+    Kept beside `_score_payload` and used by every endpoint that reports a run,
+    for the same reason: three callers formatting the same measurements three
+    different ways is how an export ends up disagreeing with the page it was
+    exported from.
+    """
+    measured = perf.from_run(run)
+    if measured is None or not measured.measured:
+        return None
+    return {
+        "calls": measured.calls,
+        "measured_calls": measured.measured_calls,
+        "ttft_ms": {"p50": measured.ttft_p50, "p90": measured.ttft_p90},
+        "output_tokens_per_second": {"p50": measured.tps_p50, "p90": measured.tps_p90},
+        "tokens": {
+            "prompt": measured.prompt_tokens,
+            "completion": measured.completion_tokens,
+        },
+        "cost_usd": measured.total_cost_usd,
+        "runtime": run.get("runtime"),
+        "quantization": run.get("quantization"),
+        "note": (
+            "Measured on the model under test only; the judge is not timed. "
+            "Percentiles come from this run alone, not a rolling window. Local "
+            "throughput is bound by this machine's hardware and is not comparable "
+            "to a hosted provider's published figures."
+        ),
+    }
+
+
+def _score_payload(run: dict[str, Any], summary: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The Litmus Score in JSON form, or None when nothing has scored yet.
+
+    Kept in one place so the list endpoint, the detail endpoint and the export
+    cannot drift into reporting the same run three slightly different ways.
+    """
+    comp = scoring.composite(summary)
+    if comp is None:
+        return None
+    return {
+        "score": comp.score,
+        "scale": "0-100, higher is better",
+        "metrics_used": comp.metric_count,
+        "cases": comp.cases,
+        "thin_evidence": comp.thin,
+        "caveat": comp.caveat or None,
+        # Two scores are rankable against each other only when these match.
+        "comparability_key": scoring.comparability_key(
+            run.get("dataset_id"), run.get("metrics"), run.get("judge_model")
+        ),
+        "note": (
+            "Mean of this run's metric averages, each oriented so higher is "
+            "better. Not comparable to published benchmark indices."
+        ),
+    }
 
 
 def _form_list(raw: list[str] | None) -> list[str]:
@@ -262,7 +354,25 @@ def _comparison_view(comparison_id: int) -> dict[str, Any]:
 
     status_by_model = {c["model_name"]: dict(c) for c in children}
 
+    # Overall standings. Every model in a comparison ran the same dataset,
+    # metrics and judge by construction, so their Litmus Scores are comparable
+    # to each other without any further caveat -- this is the one place in the
+    # app where ranking by the composite is unambiguously fair.
+    composites: dict[str, Any] = {}
+    for model, by_metric in cells.items():
+        comp = scoring.composite(list(by_metric.values()))
+        if comp is not None:
+            composites[model] = comp
+    overall_rank = {
+        model: i + 1
+        for i, model in enumerate(
+            sorted(composites, key=lambda m: composites[m].score, reverse=True)
+        )
+    }
+
     return {
+        "composites": composites,
+        "overall_rank": overall_rank,
         "metric_labels": metric_labels,
         "model_labels": model_labels,
         "cells": cells,
@@ -340,11 +450,21 @@ async def ui_models_grid(request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/models")
-async def api_models():
-    """Ollama models currently pulled, via GET {OLLAMA_HOST}/api/tags."""
+async def api_models(runtime: str | None = None):
+    """Local models across every runtime, or just the one named.
+
+    `?runtime=llamacpp` narrows it, and in that form a runtime being down is a
+    503 -- you asked about that backend specifically. Unfiltered, a single
+    backend being down is not an error, so the other runtimes' models still
+    come back and the per-runtime detail is in /api/runtimes.
+    """
+    if runtime is not None and runtime not in runtimes.RUNTIMES:
+        raise HTTPException(
+            404, f"Unknown runtime '{runtime}'. Known: {', '.join(runtimes.RUNTIME_ORDER)}"
+        )
     try:
-        return {"models": await model_registry.list_local_models()}
-    except OllamaUnavailable as exc:
+        return {"models": await model_registry.list_local_models(runtime=runtime)}
+    except RuntimeUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
 
 
@@ -361,13 +481,45 @@ async def api_metrics():
 
 @app.get("/api/health")
 async def api_health():
+    statuses = await runtimes.probe_all()
     return {
         "ok": True,
-        "ollama_host": config.OLLAMA_HOST,
-        "ollama_up": await model_registry.ollama_is_up(),
+        "runtimes": [st.as_dict() for st in statuses],
+        "default_runtime": config.DEFAULT_RUNTIME,
         "default_judge": DEFAULT_JUDGE,
         "db": str(config.DB_PATH),
+        # Kept so existing health checks and scripts don't break.
+        "ollama_host": config.OLLAMA_HOST,
+        "ollama_up": next((st.up for st in statuses if st.key == "ollama"), False),
     }
+
+
+@app.get("/api/runtimes")
+async def api_runtimes():
+    """Every local runtime: reachable, installed, how many models, how to fix."""
+    return {"runtimes": [st.as_dict() for st in await runtimes.probe_all()]}
+
+
+@app.post("/api/runtimes/start")
+async def api_start_runtime(runtime: str = Form(...)):
+    """Start a local runtime on demand.
+
+    Runs are already self-starting, so this exists for the case where you want
+    the runtime up *before* committing to a run -- to see what it is serving,
+    or to confirm the auto-start works at all rather than discovering it two
+    minutes into an evaluation.
+    """
+    key = runtime.strip()
+    if key not in runtimes.RUNTIMES:
+        raise HTTPException(
+            404, f"Unknown runtime '{key}'. Known: {', '.join(runtimes.RUNTIME_ORDER)}"
+        )
+    rt = runtimes.get(key)
+    try:
+        await runtimes.ensure_running(rt)
+    except RuntimeUnavailable as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return (await runtimes.probe(rt)).as_dict()
 
 
 @app.post("/api/models/pull")
@@ -375,7 +527,7 @@ async def api_pull_model(model: str = Form(...)):
     """Pull a model. Blocks until the download finishes -- large models are slow."""
     try:
         return await model_registry.pull_model(model.strip())
-    except (OllamaUnavailable, RuntimeError) as exc:
+    except (RuntimeUnavailable, RuntimeError) as exc:
         raise HTTPException(502, str(exc)) from exc
 
 
@@ -383,7 +535,7 @@ async def api_pull_model(model: str = Form(...)):
 async def api_delete_model(model: str = Form(...)):
     try:
         return await model_registry.delete_model(model.strip())
-    except (OllamaUnavailable, RuntimeError) as exc:
+    except (RuntimeUnavailable, RuntimeError) as exc:
         raise HTTPException(502, str(exc)) from exc
 
 
@@ -501,7 +653,11 @@ async def api_stop_eval(request: Request, run_id: int):
 
 @app.get("/api/evals")
 async def api_list_evals(limit: int = 200):
-    return {"runs": database.list_eval_runs(limit=limit)}
+    runs = database.list_eval_runs(limit=limit)
+    for run in runs:
+        run["litmus_score"] = _score_payload(run, run.get("summary") or [])
+        run["performance"] = _perf_payload(run)
+    return {"runs": runs}
 
 
 @app.get("/api/evals/{run_id}")
@@ -509,10 +665,13 @@ async def api_eval_detail(run_id: int):
     run = database.get_eval_run(run_id)
     if not run:
         raise HTTPException(404, "No such eval run.")
+    summary = database.get_run_summary(run_id)
     return {
         **run,
         "is_running": eval_runner.is_running(run_id),
-        "summary": database.get_run_summary(run_id),
+        "litmus_score": _score_payload(run, summary),
+        "performance": _perf_payload(run),
+        "summary": summary,
         "results": database.get_run_results(run_id),
     }
 
@@ -533,9 +692,12 @@ async def api_export_json(run_id: int):
     run = database.get_eval_run(run_id)
     if not run:
         raise HTTPException(404, "No such eval run.")
+    summary = database.get_run_summary(run_id)
     payload = {
         "run": run,
-        "summary": database.get_run_summary(run_id),
+        "litmus_score": _score_payload(run, summary),
+        "performance": _perf_payload(run),
+        "summary": summary,
         "results": database.get_run_results(run_id),
     }
     return JSONResponse(
@@ -580,12 +742,60 @@ async def api_export_markdown(run_id: int):
         f"# LitmusLLM report -- run #{run_id}",
         "",
         f"- **Model:** `{run['model_name']}` ({run['model_type']})",
+        f"- **Served by:** {run.get('runtime') or 'unrecorded'}"
+        + (f" at `{run['quantization']}`" if run.get("quantization") else ""),
         f"- **Judge:** `{run['judge_model']}`",
         f"- **Dataset:** {run['dataset_name']} ({run['progress_total']} cases)",
         f"- **Status:** {run['status']}",
         f"- **Started:** {run['started_at']}",
         f"- **Completed:** {run['completed_at'] or '--'}",
         "",
+    ]
+
+    comp = scoring.composite(summary)
+    if comp is not None:
+        lines += [
+            f"## Litmus Score: {comp.score:.1f} / 100",
+            "",
+            f"Mean of {comp.metric_count} metric average(s) over {comp.cases} scored "
+            "case(s), each oriented so that higher is better.",
+            "",
+            f"Comparable only with runs tagged `{scoring.comparability_key(run.get('dataset_id'), run.get('metrics'), run.get('judge_model'))}` "
+            "-- same dataset, same metrics, same judge. This is **not** an "
+            "Artificial Analysis Intelligence Index score and cannot be read "
+            "against one.",
+            "",
+        ]
+        if comp.thin:
+            lines += [f"> Thin evidence: {comp.caveat}.", ""]
+
+    measured = perf.from_run(run)
+    if measured is not None and measured.measured:
+        lines += [
+            "## Speed & cost",
+            "",
+            "| Measure | p50 | p90 |",
+            "| --- | ---: | ---: |",
+            f"| Time to first token | {measured.ttft_label} | {measured.ttft_p90_label} |",
+            f"| Output speed | {measured.tps_label} | "
+            + (f"{measured.tps_p90:.1f} tok/s" if measured.tps_p90 is not None else "--")
+            + " |",
+            "",
+            f"{measured.completion_tokens:,} output tokens from {measured.prompt_tokens:,} "
+            f"input tokens over {measured.calls} generation(s). Cost: {measured.cost_label}.",
+            "",
+            "> Measured on the model under test only -- the judge is not timed. "
+            + (
+                "Local throughput measures this machine, not the model, and does not "
+                "compare to a hosted provider's published speeds."
+                if run["model_type"] == "local"
+                else "First-token latency includes the network path from this machine, "
+                     "and these percentiles come from one run rather than a rolling window."
+            ),
+            "",
+        ]
+
+    lines += [
         "## Scores",
         "",
         "| Metric | Avg score | Pass rate | Cases scored |",
@@ -702,6 +912,15 @@ async def api_comparison_export(comparison_id: int):
             r["model_name"], r["metric_name"], r["average_score"],
             r["pass_rate"], r["scored_cases"], r["rank"],
         ])
+    # The composite goes in the same file rather than a second endpoint, using
+    # the pseudo-metric name "Litmus Score" so a spreadsheet filter on the
+    # metric column separates it from the raw per-metric rows.
+    view = _comparison_view(comparison_id)
+    for model, comp in view["composites"].items():
+        writer.writerow([
+            model, "Litmus Score", comp.score, "", comp.cases,
+            view["overall_rank"].get(model),
+        ])
     return PlainTextResponse(
         buf.getvalue(), media_type="text/csv",
         headers={
@@ -723,11 +942,14 @@ async def api_comparison_markdown(comparison_id: int):
         f"- **Judge:** `{cmp_run['judge_model']}`",
         f"- **Status:** {cmp_run['status']}",
         "",
-        "| Model | " + " | ".join(view["metric_labels"]) + " |",
-        "| --- | " + " | ".join("---:" for _ in view["metric_labels"]) + " |",
+        "| Model | Litmus Score | " + " | ".join(view["metric_labels"]) + " |",
+        "| --- | ---: | " + " | ".join("---:" for _ in view["metric_labels"]) + " |",
     ]
     for model in view["model_labels"]:
-        cells = []
+        comp = view["composites"].get(model)
+        rank = view["overall_rank"].get(model)
+        overall = "--" if comp is None else f"**{comp.score:.1f}** (#{rank})"
+        cells = [overall]
         for label in view["metric_labels"]:
             cell = view["cells"].get(model, {}).get(label)
             if not cell or cell["average_score"] is None:
@@ -736,7 +958,17 @@ async def api_comparison_markdown(comparison_id: int):
                 marker = " **(best)**" if view["best"].get(label) == cell["average_score"] else ""
                 cells.append(f"{fmt_score(cell['average_score'])} (#{cell['rank']}){marker}")
         lines.append(f"| `{model}` | " + " | ".join(cells) + " |")
-    lines += ["", "Higher is better except for Toxicity, Bias and Hallucination.", ""]
+    lines += [
+        "",
+        "Higher is better except for Toxicity, Bias and Hallucination.",
+        "",
+        "The Litmus Score is the mean of each model's metric averages, oriented "
+        "so higher is always better and scaled 0-100. Every model here ran the "
+        "same dataset, metrics and judge, so the scores rank fairly against each "
+        "other -- but not against published benchmark indices, or against runs "
+        "configured differently.",
+        "",
+    ]
     return PlainTextResponse(
         "\n".join(lines), media_type="text/markdown",
         headers={
@@ -777,6 +1009,163 @@ def _reference_view(highlight_families: list[str] | None = None) -> dict[str, An
             "highlighted": [bool(r["family"] in highlight) for r in rows[:24]],
         }),
     }
+
+
+async def _benchmark_context(model_id: str | None = None) -> dict[str, Any]:
+    """Everything the benchmarks page needs, including what it *can't* run."""
+    options = await model_options()
+    chosen = model_id or (options["chat_models"][0]["id"] if options["chat_models"] else None)
+
+    available = None
+    if chosen:
+        spec = model_registry.parse_model_id(chosen)
+        if spec.kind == "local":
+            available = await harness.availability(spec.runtime, spec.name)
+
+    runs = database.list_benchmark_runs(limit=100)
+    return {
+        **options,
+        "tasks": harness.TASKS,
+        "selected_model": chosen,
+        "availability": available.as_dict() if available else None,
+        "harness_installed": harness.harness_installed() is not None,
+        "runs": runs,
+        # Without this the results table renders without its poller, so loading
+        # the page while a benchmark is live would show a frozen progress note
+        # until the user refreshed by hand.
+        "any_running": any(eval_runner.benchmark_is_running(r["id"]) for r in runs),
+    }
+
+
+@app.get("/benchmarks", response_class=HTMLResponse)
+async def page_benchmarks(request: Request, model: str | None = None):
+    """Ground-truth benchmarks: accuracy against known answers, not a judge."""
+    return render(
+        request, "benchmarks.html", active="benchmarks",
+        **await _benchmark_context(model),
+    )
+
+
+@app.get("/ui/benchmark-runs", response_class=HTMLResponse)
+async def ui_benchmark_runs(request: Request):
+    """Polled while a benchmark is live so progress and results appear."""
+    runs = database.list_benchmark_runs(limit=100)
+    return render(
+        request, "partials/benchmark_runs.html",
+        runs=runs,
+        any_running=any(eval_runner.benchmark_is_running(r["id"]) for r in runs),
+    )
+
+
+@app.get("/ui/benchmark-picker", response_class=HTMLResponse)
+async def ui_benchmark_picker(request: Request, model: str | None = None):
+    """Re-rendered when the model changes: availability is model-specific."""
+    return render(
+        request, "partials/benchmark_picker.html", **await _benchmark_context(model)
+    )
+
+
+@app.post("/api/benchmarks")
+async def api_start_benchmark(
+    request: Request,
+    model: str = Form(...),
+    task: str = Form(...),
+    limit: str = Form(""),
+    allow_code_execution: str = Form(""),
+):
+    """Start one benchmark run in the background."""
+    raw_limit = (limit or "").strip()
+    try:
+        item_limit = int(raw_limit) if raw_limit else None
+    except ValueError:
+        raise HTTPException(400, f"'{raw_limit}' is not a whole number of items.") from None
+    if item_limit is not None and item_limit < 1:
+        raise HTTPException(400, "The item limit must be at least 1.")
+
+    try:
+        run_id = eval_runner.start_benchmark_run(
+            model_id=model.strip(),
+            task_key=task.strip(),
+            limit=item_limit,
+            allow_code_execution=bool(allow_code_execution),
+        )
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    if "text/html" in request.headers.get("accept", ""):
+        return RedirectResponse("/benchmarks", status_code=303)
+    return {"id": run_id, "status": "queued"}
+
+
+@app.post("/api/benchmarks/{run_id}/stop")
+async def api_stop_benchmark(request: Request, run_id: int):
+    """Kill the harness subprocess. Nothing partial is kept -- lm-eval only
+    reports a score once every item is done."""
+    if not database.get_benchmark_run(run_id):
+        raise HTTPException(404, "No such benchmark run.")
+    stopped = eval_runner.request_benchmark_stop(run_id)
+    if "text/html" in request.headers.get("accept", ""):
+        return RedirectResponse("/benchmarks", status_code=303)
+    return {"id": run_id, "stopping": stopped}
+
+
+@app.post("/api/benchmarks/{run_id}/delete")
+async def api_delete_benchmark(run_id: int):
+    if not database.get_benchmark_run(run_id):
+        raise HTTPException(404, "No such benchmark run.")
+    eval_runner.request_benchmark_stop(run_id)
+    database.delete_benchmark_run(run_id)
+    return RedirectResponse("/benchmarks", status_code=303)
+
+
+@app.get("/api/benchmarks")
+async def api_list_benchmarks(limit: int = 200, model: str | None = None):
+    return {"runs": database.list_benchmark_runs(limit=limit, model_id=model)}
+
+
+@app.get("/api/benchmarks/tasks")
+async def api_benchmark_tasks(model: str | None = None):
+    """The task catalogue, annotated with what this model can actually run."""
+    payload: dict[str, Any] = {
+        "harness_installed": harness.harness_installed() is not None,
+        "tasks": [
+            {
+                "key": t.key, "label": t.label, "blurb": t.blurb, "kind": t.kind,
+                "metric": t.metric_label, "items": t.items,
+                "default_limit": t.default_limit, "num_fewshot": t.num_fewshot,
+                "needs_code_execution": t.needs_code_execution,
+                "contamination": t.contamination, "source_url": t.source_url,
+            }
+            for t in harness.TASKS
+        ],
+    }
+    if model:
+        spec = model_registry.parse_model_id(model)
+        if spec.kind == "local":
+            payload["availability"] = (
+                await harness.availability(spec.runtime, spec.name)
+            ).as_dict()
+    return payload
+
+
+@app.get("/scorecard", response_class=HTMLResponse)
+async def page_scorecard(request: Request, limit: int = 200):
+    """Every run in one sortable table: quality against speed, memory and cost."""
+    return render(
+        request, "scorecard.html", active="scorecard",
+        card=scorecard_mod.build(database.list_eval_runs(limit=limit)),
+    )
+
+
+@app.get("/api/scorecard.csv")
+async def api_scorecard_csv(limit: int = 200):
+    """The scorecard as CSV -- the artefact you actually rank models in."""
+    card = scorecard_mod.build(database.list_eval_runs(limit=limit))
+    return PlainTextResponse(
+        scorecard_mod.to_csv(card),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="litmusllm-scorecard.csv"'},
+    )
 
 
 @app.get("/reference", response_class=HTMLResponse)

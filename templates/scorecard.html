@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{% block title %}Scorecard &middot; LitmusLLM{% endblock %}
+
+{% block content %}
+<div class="space-y-5">
+  <header class="flex flex-wrap items-end justify-between gap-3">
+    <div>
+      <h1 class="text-2xl font-semibold tracking-tight">Scorecard</h1>
+      <p class="mt-1 max-w-3xl text-sm text-slate-600 dark:text-slate-400">
+        Every run in one table &mdash; quality, speed, memory and cost, alongside how the model
+        was actually served. Sort by whichever constraint is real for you: best score under a
+        throughput floor, cheapest above a quality bar, smallest that still passes.
+      </p>
+    </div>
+    <a href="/api/scorecard.csv"
+       class="rounded-md border border-slate-300 px-3 py-1.5 text-sm hover:bg-slate-100
+              dark:border-slate-700 dark:hover:bg-slate-800">
+      Download CSV
+    </a>
+  </header>
+
+  {% if card.rows %}
+    {# The one thing a table sorted by score can mislead about. Stated above the
+       table rather than below it, because by the time you have read the rows
+       you have already drawn the comparison. #}
+    <div class="rounded-lg border border-sky-200 bg-sky-50 p-3 text-xs leading-relaxed
+                text-sky-900 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-200">
+      Litmus Scores compare only within a matching <strong>setup</strong> tag &mdash; same dataset,
+      same metrics, same judge. This table holds
+      {{ card.setup_groups|length }} setup{{ '' if card.setup_groups|length == 1 else 's' }},
+      {{ card.comparable_groups }} of which contain{{ 's' if card.comparable_groups == 1 else '' }}
+      more than one run. Rows with different tags sit next to each other for convenience, not
+      because their scores can be read against each other.
+    </div>
+
+    <div class="overflow-x-auto rounded-xl border border-slate-200 dark:border-slate-800">
+      <table class="min-w-[88rem] w-full text-left text-sm">
+        <thead class="bg-slate-50 text-xs uppercase tracking-wide text-slate-500
+                      dark:bg-slate-900 dark:text-slate-400">
+          <tr>
+            <th class="px-3 py-3 font-medium">Model</th>
+            <th class="px-3 py-3 font-medium" title="How the weights were served for this run">
+              Served as
+            </th>
+            <th class="px-3 py-3 font-medium" title="Mean of this run's metric averages, 0-100">
+              Litmus
+            </th>
+            {% for label in card.metric_labels %}
+              <th class="px-3 py-3 font-medium">{{ label }}</th>
+            {% endfor %}
+            {% for task in card.benchmark_tasks %}
+              <th class="px-3 py-3 font-medium text-sky-700 dark:text-sky-300"
+                  title="{{ task.blurb }} Ground-truth accuracy, not a judge score.">
+                {{ task.label }}
+              </th>
+            {% endfor %}
+            <th class="px-3 py-3 font-medium" title="Median output tokens per second">tok/s</th>
+            <th class="px-3 py-3 font-medium" title="Median time to first token">TTFT</th>
+            <th class="px-3 py-3 font-medium" title="Accelerator memory held while the run was live">
+              Memory
+            </th>
+            <th class="px-3 py-3 font-medium">Cost</th>
+            <th class="px-3 py-3 font-medium" title="Runs with the same tag are comparable">Setup</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-slate-200 dark:divide-slate-800">
+          {% for row in card.rows %}
+            <tr class="hover:bg-slate-50 dark:hover:bg-slate-900/60">
+              <td class="px-3 py-3">
+                <a href="/runs/{{ row.run_id }}" class="font-mono text-xs hover:underline">
+                  {{ row.model }}
+                </a>
+                <span class="block text-[10px] uppercase text-slate-400">
+                  {{ row.model_type }} &middot; run #{{ row.run_id }}
+                </span>
+              </td>
+              <td class="px-3 py-3 text-xs text-slate-600 dark:text-slate-400">
+                {{ row.served_label }}
+              </td>
+              <td class="px-3 py-3">
+                {% if row.score is not none %}
+                  {% set band = {'strong':'emerald','fair':'lime','weak':'amber','poor':'red'}[row.composite.band] %}
+                  <span class="font-semibold tabular-nums text-{{ band }}-600 dark:text-{{ band }}-400">
+                    {{ '%.1f'|format(row.score) }}
+                  </span>
+                  {% if row.thin %}
+                    <span class="ml-0.5 text-amber-500" title="{{ row.composite.caveat }}">!</span>
+                  {% endif %}
+                {% else %}
+                  <span class="text-slate-400">--</span>
+                {% endif %}
+              </td>
+              {% for label in card.metric_labels %}
+                <td class="px-3 py-3 text-xs tabular-nums">
+                  {% set value = row.metrics.get(label) %}
+                  {% if value is not none %}{{ value|score }}{% else %}<span class="text-slate-400">--</span>{% endif %}
+                </td>
+              {% endfor %}
+              {# Benchmarks are tinted differently because they are a different
+                 kind of number: accuracy against known answers, on a scale
+                 other people's published figures also use. #}
+              {% for task in card.benchmark_tasks %}
+                <td class="px-3 py-3 text-xs tabular-nums text-sky-700 dark:text-sky-300">
+                  {{ row.benchmark_label(task.key) }}
+                  {% set n = row.benchmark_samples(task.key) %}
+                  {% if n %}
+                    <span class="block text-[10px] text-slate-400">{{ n }} items</span>
+                  {% endif %}
+                </td>
+              {% endfor %}
+              <td class="px-3 py-3 text-xs tabular-nums">{{ row.tps_label }}</td>
+              <td class="px-3 py-3 text-xs tabular-nums">{{ row.ttft_label }}</td>
+              <td class="px-3 py-3 text-xs tabular-nums">{{ row.vram_label }}</td>
+              <td class="px-3 py-3 text-xs tabular-nums">{{ row.cost_label }}</td>
+              <td class="px-3 py-3">
+                <span class="font-mono text-[10px] text-slate-400">{{ row.setup_tag }}</span>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <p class="text-xs leading-relaxed text-slate-500 dark:text-slate-400">
+      Benchmark columns (tinted) are ground-truth accuracy from lm-evaluation-harness, shown with a
+      95% interval &mdash; two models whose intervals overlap are tied, however different the
+      headline numbers look. They attach to the model, not the run, so re-running an eval does not
+      change them. Everything else is judge-scored and compares only within a matching setup tag.
+      Speed and memory are measured on the model under test only &mdash; the judge is never timed.
+      For local models these numbers describe <em>this machine</em>, not the model: the same weights
+      on other hardware give different figures, and they do not line up with a hosted provider's
+      published speeds. Memory is reported by Ollama only; other runtimes leave it blank rather
+      than guess. Cost is blank for local runs because there is no invoice, not because inference
+      is free.
+    </p>
+  {% else %}
+    <div class="rounded-xl border border-dashed border-slate-300 p-12 text-center dark:border-slate-700">
+      <p class="text-sm text-slate-500 dark:text-slate-400">
+        No scored runs yet. <a href="/" class="text-amber-600 hover:underline">Start one</a>
+        and it will appear here.
+      </p>
+    </div>
+  {% endif %}
+</div>
+{% endblock %}

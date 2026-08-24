@@ -1,8 +1,10 @@
 """Model discovery and identity.
 
 Two sources of models feed the app:
-  * **local**  -- whatever `ollama` currently has pulled, discovered live via
-                  the native API at GET /api/tags.
+  * **local**  -- whatever the local inference runtimes currently hold. Ollama,
+                  LM Studio and llama.cpp are each discovered live; see
+                  runtimes.py, which owns probing, auto-start and the
+                  per-runtime differences in how models are listed.
   * **cloud**  -- a hand-maintained list of flagship models reached through
                   LiteLLM, each mapped to the env var holding its API key.
 
@@ -10,26 +12,32 @@ Both are normalised into a single `ModelSpec` so the rest of the app never
 has to branch on "is this local or cloud" except where it genuinely matters
 (which HTTP client to use, and whether an API key is required).
 
-Model id format: "local:<ollama tag>" or "cloud:<litellm model string>".
+Model id format:
+    "local:<ollama tag>"       -- Ollama. The prefix predates multi-runtime
+                                  support and is kept unchanged so historical
+                                  runs still resolve.
+    "lmstudio:<model key>"     -- LM Studio
+    "llamacpp:<model id>"      -- llama.cpp
+    "cloud:<litellm model string>"
 """
 from __future__ import annotations
 
-import asyncio
 import os
-import re
-import shutil
-import subprocess
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
 
 import httpx
 
-from config import OLLAMA_HOST, REQUEST_TIMEOUT
-
-
-class OllamaUnavailable(RuntimeError):
-    """Raised when Ollama can't be reached and couldn't be auto-started."""
+import runtimes
+from config import DEFAULT_RUNTIME, OLLAMA_HOST, REQUEST_TIMEOUT
+from runtimes import (  # re-exported: existing callers import these from here
+    EMBEDDING_FAMILIES,
+    FAMILY_BLURBS,
+    OllamaUnavailable,
+    RuntimeUnavailable,
+    ensure_ollama_running,
+    ollama_is_up,
+)
 
 
 @dataclass(frozen=True)
@@ -41,6 +49,18 @@ class ModelSpec:
     label: str       # display name
     provider: str = "ollama"
     api_key_env: str | None = None
+    runtime: str = DEFAULT_RUNTIME   # which local runtime serves it; unused when cloud
+
+    @property
+    def base_url(self) -> str | None:
+        """OpenAI-compatible root for local models; None for cloud (LiteLLM routes)."""
+        if self.kind != "local":
+            return None
+        return runtimes.get(self.runtime).api_base
+
+    @property
+    def runtime_label(self) -> str:
+        return runtimes.get(self.runtime).label if self.kind == "local" else self.provider
 
     @property
     def requires_key(self) -> bool:
@@ -154,167 +174,40 @@ FLAGSHIP_MODELS: tuple[dict[str, Any], ...] = (
     },
 )
 
-# Short descriptions for local model families, keyed by the `family` field
-# Ollama reports. This is a small built-in table rather than a scrape of
-# ollama.com/library -- it keeps the app fully offline and never breaks when
-# the website's markup changes.
-FAMILY_BLURBS: dict[str, str] = {
-    "llama": "Meta's Llama family. Strong general-purpose instruction following.",
-    "qwen": "Alibaba's Qwen family. Notably strong at multilingual and coding tasks.",
-    "qwen2": "Alibaba's Qwen2 family. Strong multilingual and reasoning performance.",
-    "qwen3": "Alibaba's Qwen3 family. Latest generation, with reasoning modes.",
-    "gemma": "Google's Gemma family. Small, efficient, permissively licensed.",
-    "gemma2": "Google's Gemma 2 family. Efficient models tuned for quality per parameter.",
-    "gemma3": "Google's Gemma 3 family. Efficient open models with vision variants.",
-    "phi3": "Microsoft's Phi-3 family. Small models trained on textbook-quality data.",
-    "mistral": "Mistral AI's family. Fast, capable models with strong European language support.",
-    "mixtral": "Mistral's mixture-of-experts models. High quality per active parameter.",
-    "deepseek2": "DeepSeek's MoE family. Strong reasoning and coding.",
-    "starcoder2": "BigCode's code-specialised family.",
-    "codellama": "Meta's code-specialised Llama variant.",
-    "nomic-bert": "Embedding model -- not suitable for generation or judging.",
-    "bert": "Embedding model -- not suitable for generation or judging.",
-}
-
-# Families that can't do chat completion, so they must not appear as
-# evaluation targets or judges.
-EMBEDDING_FAMILIES = {"nomic-bert", "bert"}
-
-
 # ---------------------------------------------------------------------------
-# Ollama
+# Local models
 # ---------------------------------------------------------------------------
+# Discovery, health and auto-start all live in runtimes.py. What is left here
+# is the one thing that spans runtimes: assembling their cards into a single
+# list the pickers can render.
 
-async def ollama_is_up(timeout: float = 3.0) -> bool:
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(f"{OLLAMA_HOST}/api/tags")
-            return resp.status_code == 200
-    except (httpx.HTTPError, OSError):
-        return False
+async def list_local_models(*, runtime: str | None = None) -> list[dict[str, Any]]:
+    """Model cards from every local runtime, or just the one named.
 
+    Only the default runtime is auto-started. Listing models is a page render,
+    and a page render has no business spawning two extra inference servers --
+    the others start on demand, when a model belonging to them is actually run.
 
-async def ensure_ollama_running() -> None:
-    """Make sure Ollama is reachable, starting it locally if we're able to.
-
-    Auto-start is only attempted when the host is loopback *and* the `ollama`
-    binary is on PATH -- inside Docker, or against a remote host, we can only
-    report the problem. Raises OllamaUnavailable with actionable instructions.
+    Raises RuntimeUnavailable only when a *specific* runtime was asked for and
+    is unreachable. The unfiltered call never raises: with three backends, one
+    being down is a normal state to render, not an error to 500 on.
     """
-    if await ollama_is_up():
-        return
+    if runtime is not None:
+        return await runtimes.list_models(runtimes.get(runtime))
 
-    is_local = any(h in OLLAMA_HOST for h in ("localhost", "127.0.0.1", "0.0.0.0"))
-    binary = shutil.which("ollama")
-
-    if is_local and binary:
-        try:
-            # Detached so it outlives this request; output discarded because
-            # `ollama serve` logs continuously and we don't consume them.
-            subprocess.Popen(
-                [binary, "serve"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except OSError as exc:
-            raise OllamaUnavailable(
-                f"Tried to start Ollama automatically but failed: {exc}. "
-                f"Start it yourself with `ollama serve`."
-            ) from exc
-
-        # Give the server a few seconds to bind its port.
-        for _ in range(20):
-            await asyncio.sleep(0.5)
-            if await ollama_is_up():
-                return
-
-        raise OllamaUnavailable(
-            "Started `ollama serve` but it did not become reachable within 10s at "
-            f"{OLLAMA_HOST}. Run `ollama serve` in a terminal and check its output."
-        )
-
-    if is_local:
-        raise OllamaUnavailable(
-            f"Ollama is not running at {OLLAMA_HOST} and the `ollama` binary is not on "
-            "PATH. Install it from https://ollama.com, then run `ollama serve`."
-        )
-
-    raise OllamaUnavailable(
-        f"Ollama is not reachable at {OLLAMA_HOST}. If you're running under Docker "
-        "Compose, check that the `ollama` service is healthy (`docker compose ps`) "
-        "and that OLLAMA_HOST points at it (http://ollama:11434)."
-    )
+    models, statuses = await runtimes.all_local_models()
+    if not models:
+        # Nothing anywhere. Surface the default runtime's reason, which is the
+        # one the user most likely wants to hear about.
+        primary = next((st for st in statuses if st.key == DEFAULT_RUNTIME), None)
+        if primary is not None and primary.error:
+            raise RuntimeUnavailable(primary.error)
+    return models
 
 
-def _humanise_size(num_bytes: int) -> str:
-    gb = num_bytes / 1_000_000_000
-    return f"{gb:.2f} GB" if gb >= 1 else f"{num_bytes / 1_000_000:.0f} MB"
-
-
-def _humanise_date(raw: str | None) -> str:
-    """Format Ollama's RFC3339 timestamps for display.
-
-    Ollama reports nanosecond precision (e.g. '...T21:50:16.07926522+02:00'),
-    which `datetime.fromisoformat` rejects on Python < 3.11, so the fractional
-    part is truncated to the six digits it accepts.
-    """
-    if not raw:
-        return "unknown"
-    cleaned = raw.replace("Z", "+00:00")
-    cleaned = re.sub(r"\.(\d{6})\d+", r".\1", cleaned)
-    try:
-        return datetime.fromisoformat(cleaned).strftime("%Y-%m-%d %H:%M")
-    except (ValueError, TypeError):
-        return raw[:16]
-
-
-def _family_of(details: dict[str, Any], name: str) -> str:
-    family = (details.get("family") or "").lower()
-    if family:
-        return family
-    # Fall back to the leading segment of the tag, e.g. 'llama3.1:8b' -> 'llama3'.
-    return name.split(":")[0].split(".")[0].lower()
-
-
-async def list_local_models() -> list[dict[str, Any]]:
-    """Fetch pulled Ollama models as enriched model cards.
-
-    Raises OllamaUnavailable if the daemon can't be reached (after one
-    auto-start attempt), so callers can surface a clear instruction.
-    """
-    await ensure_ollama_running()
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        resp = await client.get(f"{OLLAMA_HOST}/api/tags")
-        resp.raise_for_status()
-        payload = resp.json()
-
-    cards: list[dict[str, Any]] = []
-    for entry in payload.get("models", []):
-        name = entry.get("name") or entry.get("model") or "unknown"
-        details = entry.get("details") or {}
-        family = _family_of(details, name)
-        cards.append({
-            "id": f"local:{name}",
-            "kind": "local",
-            "name": name,
-            "label": name,
-            "provider": "ollama",
-            "size_bytes": entry.get("size", 0),
-            "size": _humanise_size(entry.get("size", 0)),
-            "modified_at": _humanise_date(entry.get("modified_at")),
-            "family": family,
-            "family_label": (details.get("family") or family).title(),
-            "parameter_size": details.get("parameter_size") or "unknown",
-            "quantization": details.get("quantization_level") or "unknown",
-            "format": details.get("format") or "unknown",
-            "blurb": FAMILY_BLURBS.get(family, "Locally hosted model served by Ollama."),
-            "chat_capable": family not in EMBEDDING_FAMILIES,
-            "requires_key": False,
-            "key_present": True,
-        })
-    cards.sort(key=lambda c: c["name"])
-    return cards
+async def local_runtime_status() -> list[dict[str, Any]]:
+    """Per-runtime health, for the models page and /api/health."""
+    return [st.as_dict() for st in await runtimes.probe_all()]
 
 
 def flagship_model_cards() -> list[dict[str, Any]]:
@@ -341,17 +234,32 @@ _FLAGSHIP_BY_NAME = {m["name"]: m for m in FLAGSHIP_MODELS}
 
 
 def parse_model_id(model_id: str) -> ModelSpec:
-    """Turn a 'local:...' / 'cloud:...' id into a ModelSpec.
+    """Turn a prefixed model id into a ModelSpec.
 
-    A bare string with no prefix is treated as a local Ollama tag, which keeps
-    the `judge` form field forgiving.
+    Local prefixes are matched against the runtime registry rather than a
+    hardcoded list, so adding a runtime in runtimes.py is enough to make its
+    ids resolve here. Splitting on the *first* colon only matters for local
+    ids, where the remainder is itself colon-bearing -- 'local:llama3.1:8b'
+    must yield the tag 'llama3.1:8b', not 'llama3.1'.
+
+    A bare string with no recognised prefix is treated as a model on the
+    default runtime, which keeps the `judge` form field forgiving.
     """
-    if model_id.startswith("local:"):
-        name = model_id[len("local:") :]
-        return ModelSpec(id=model_id, kind="local", name=name, label=name)
+    prefix, _, remainder = model_id.partition(":")
 
-    if model_id.startswith("cloud:"):
-        name = model_id[len("cloud:") :]
+    rt = runtimes.runtime_for_prefix(prefix)
+    if rt is not None and remainder:
+        return ModelSpec(
+            id=model_id,
+            kind="local",
+            name=remainder,
+            label=remainder,
+            provider=rt.key,
+            runtime=rt.key,
+        )
+
+    if prefix == "cloud" and remainder:
+        name = remainder
         entry = _FLAGSHIP_BY_NAME.get(name)
         if entry:
             return ModelSpec(
@@ -373,7 +281,15 @@ def parse_model_id(model_id: str) -> ModelSpec:
             api_key_env=f"{provider.upper().replace('-', '_')}_API_KEY",
         )
 
-    return ModelSpec(id=f"local:{model_id}", kind="local", name=model_id, label=model_id)
+    default = runtimes.get(DEFAULT_RUNTIME)
+    return ModelSpec(
+        id=f"{default.prefix}:{model_id}",
+        kind="local",
+        name=model_id,
+        label=model_id,
+        provider=default.key,
+        runtime=default.key,
+    )
 
 
 async def pull_model(name: str) -> dict[str, Any]:

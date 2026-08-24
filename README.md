@@ -132,6 +132,199 @@ recorded reason**, not silently zeroed and not fatal — so mixing
 Answer Relevancy with Faithfulness on a partly-annotated dataset gives you real
 numbers for the cases that qualify.
 
+## The Litmus Score
+
+Per-metric averages are the honest output, but "0.82 relevancy / 0.14
+hallucination / 0.91 recall" against "0.79 / 0.09 / 0.88" is a comparison most
+people abandon halfway through. So every run also gets one number:
+
+> **Litmus Score** = mean of the run's metric averages, each flipped so higher
+> is always better, scaled 0–100.
+
+Toxicity 0.05 counts as 0.95. Relevancy 0.82 counts as 0.82. Two metrics, both
+weighted equally → **88.5**. It appears on the run page, as a dashboard column,
+as the leading column of every comparison leaderboard, and in all three export
+formats.
+
+**Metric selection is the weighting.** There are no per-metric weights, because
+LitmusLLM doesn't know whether faithfulness matters twice as much as relevancy
+for what you're building. The metrics you choose to run are the ones that count.
+
+### The setup tag, and why it's there
+
+A Litmus Score is an LLM judge's opinion of *your* prompts on *your* metrics.
+Change the dataset, the metric set or the judge model and the number moves for
+reasons that have nothing to do with the model under test. So each run carries a
+six-character **setup tag** — a fingerprint of exactly those three things:
+
+```
+llama3.1:8b    88.5   885eb6
+qwen2.5:14b    60.0   885eb6   ← same tag, ranks fairly against the above
+gemma2:2b      90.0   28b413   ← different judge, not comparable
+```
+
+Matching tags mean the scores are directly rankable. Differing tags mean they
+are not, however similar the numbers look. Metric *order* is ignored, so
+selecting the same metrics in a different order still matches.
+
+Models inside a single comparison always share a tag by construction, which is
+why the comparison leaderboard ranks by Litmus Score without further caveats.
+
+### Thin evidence
+
+A score built on one metric, or on fewer than ten scored cases, is flagged with
+a `!` and a caveat line. The number is still shown — hiding it would be worse —
+but a five-case run is a smoke test, not a verdict.
+
+### It is not an Intelligence Index score
+
+This is the trap aggregation invites, so, bluntly: a Litmus Score of 71 and an
+Artificial Analysis Intelligence Index of 71 have nothing to do with each other.
+The index is ten fixed public benchmarks with known answers; a Litmus Score is a
+judge model grading your prompts. They never share an axis in the UI, and the
+[Reference page](#published-benchmarks-the-reference-page) explains why at
+length.
+
+## Local runtimes
+
+LitmusLLM talks to three local backends, and will start whichever one a run
+needs:
+
+| Runtime | Default host | Started with | Model management |
+|---|---|---|---|
+| Ollama | `localhost:11434` | `ollama serve` | pull/delete from the Models page |
+| LM Studio | `localhost:1234` | `lms server start` | in the LM Studio app |
+| llama.cpp | `localhost:8080` | `llama serve` | GGUF files in its preset |
+
+All three speak OpenAI-compatible `/v1/chat/completions`, so one transport
+drives all of them. Model ids carry the runtime: `local:llama3.1:8b` is Ollama
+(the prefix predates multi-runtime support and is kept so old runs still
+resolve), `lmstudio:...` and `llamacpp:...` are the other two.
+
+**Auto-start is deliberately narrow.** A runtime is only launched when the
+configured host is loopback *and* its binary is on PATH. Pointing at a remote
+server, or running in Docker, means the app reports the problem instead — it
+has no business starting processes on someone else's machine. Only the default
+runtime is started to populate a page; the others start on demand, when a run
+actually needs one, so opening `/models` never spawns two servers you didn't
+ask for.
+
+llama.cpp is the awkward one: its launch line is open-ended (which GGUF, what
+context size, how many GPU layers), so there is no default worth guessing. The
+router build (`llama serve`) autoloads models the way Ollama does and works out
+of the box; for classic single-model mode, put your exact command in
+`LITMUSLLM_LLAMACPP_START` and that is what gets run.
+
+## Speed, memory and cost
+
+Every run measures the model under test — **never the judge**, whose latency is
+a property of your harness rather than of the model you're characterising.
+
+- **Time to first token**, which requires streaming. A non-streamed request
+  tells you when the whole answer landed and nothing about when it started.
+- **Output tokens/sec**, measured over the post-TTFT window so a long prompt
+  isn't charged against decode speed.
+- **Token counts and cost.** Cost comes from LiteLLM's own pricing tables
+  rather than a table maintained here, which would go stale.
+- **Resident memory**, read from Ollama's `/api/ps` mid-run, while the model is
+  actually loaded. Other runtimes don't report it and are left blank.
+
+Everything is reported as **p50/p90/p99, not a mean**. One 40-second stall
+inside fifty 2-second calls barely moves a mean and completely changes how the
+model feels to use.
+
+Three caveats the UI repeats, because they decide whether the numbers mean
+anything outside your laptop:
+
+1. **Local throughput measures your machine, not the model.** The same weights
+   on other hardware give a different number. Only cloud figures line up with a
+   provider's published speeds.
+2. **These percentiles come from one run**, not a rolling window over real
+   traffic like a hosted provider publishes.
+3. **Cost is blank for local runs because there is no invoice**, not because
+   inference is free.
+
+## Ground-truth benchmarks
+
+`/benchmarks` runs fixed question sets with known answers through
+[lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness).
+This is the **only** number in the app that shares a scale with figures other
+people publish — everything else is a judge's opinion of your prompts.
+
+| Task | What it measures | Shape |
+|---|---|---|
+| GSM8K | multi-step grade-school maths | generative |
+| IFEval | checkable instruction constraints, scored by a program | generative |
+| HellaSwag | commonsense sentence completion | log-likelihood |
+| ARC Challenge | grade-school science | log-likelihood |
+| HumanEval | Python completion, `pass@1` | generative + code execution |
+
+It is **optional**: `pip install 'lm-eval[api,ifeval]'`. That pulls torch, a
+couple of gigabytes, which is why it isn't in `requirements.txt` — the rest of
+the app runs fine without it and says so instead of failing.
+
+### Ollama can't run the multiple-choice tasks
+
+Log-likelihood tasks work by asking the model to score each candidate answer,
+which needs token logprobs from the API. **Ollama returns none**, on either of
+its OpenAI-compatible endpoints. llama.cpp and LM Studio do. So HellaSwag and
+ARC are greyed out with an explanation when you pick an Ollama model, rather
+than failing two minutes into a run — and running the same weights under
+llama.cpp is the workaround. This is the clearest practical payoff of the
+multi-runtime work.
+
+### Read the interval, not the number
+
+Every score carries a 95% confidence interval, and the UI shows it everywhere
+the score appears. At 50 items the interval is roughly ±14 points; two models
+inside each other's intervals are **tied**, however different the headline
+numbers look. Public leaderboards mostly hide this. Raising the item count is
+the only thing that narrows it.
+
+### Calibrate before you believe it
+
+No homegrown harness reproduces a published figure exactly — prompt templates,
+answer extraction and shot counts each move a score by points. So run a model
+whose public number you already know first. Land inside its interval and the
+setup is sound; land eight points low and your extraction is broken, not the
+model. Those two look identical if you skip the check.
+
+Each run stores the exact `lm_eval` argv it used, so any result can be
+reproduced outside the app.
+
+### HumanEval executes code the model wrote
+
+It is scored by running model-generated Python, unsandboxed, in this process.
+That is off unless you tick the box, the box is per-run and never remembered,
+and `HF_ALLOW_CODE_EVAL` is only ever set for that one task.
+
+### Not yet covered
+
+Cloud models. Reaching one would mean standing up a LiteLLM proxy for lm-eval
+to talk to; the picker says so rather than offering an option that fails.
+
+## The Scorecard
+
+`/scorecard` puts every run in one table — Litmus Score, per-metric averages,
+tok/s, TTFT, memory, cost, and how the model was served — with a CSV export at
+`/api/scorecard.csv`. It exists for the question you actually have when picking
+a model, which is never one-dimensional: *best quality above 30 tok/s*,
+*cheapest that clears 70*, *smallest that fits in 6 GB*.
+
+Rows are runs, not models, on purpose. The same model served at Q4_K_M under
+Ollama and Q8_0 under llama.cpp is two different things to choose between, and
+averaging them would hide the trade-off the table exists to show. The setup tag
+is a column for the same reason: in a table sorted by score, rows from
+incompatible setups sit next to each other looking comparable when they aren't.
+
+### Quantization is the trap
+
+This is the most common way a local-vs-published comparison goes quietly wrong.
+Ollama serves Q4_K_M by default; published leaderboard scores are almost always
+bf16. Those are **not the same model**, and the gap on reasoning tasks is real.
+Every run records the precision it was actually served at, and the run page says
+so next to the number.
+
 ### Adding a custom metric
 
 Add one entry to `METRICS` in [`metrics_catalog.py`](metrics_catalog.py), then
@@ -295,7 +488,7 @@ clicks.
 | `POST` | `/api/datasets/upload` | Upload a CSV |
 | `POST` | `/api/evals/start` | Start a run |
 | `POST` | `/api/evals/{id}/stop` | Stop a run, keeping partial results |
-| `GET` | `/api/evals` · `/api/evals/{id}` | List / inspect runs |
+| `GET` | `/api/evals` · `/api/evals/{id}` | List / inspect runs (each with `litmus_score`) |
 | `GET` | `/api/evals/{id}/export.{json,csv,md}` | Export a run |
 | `POST` | `/api/compare` | Start a multi-model comparison |
 | `GET` | `/api/compare/{id}` | Comparison results |
@@ -361,9 +554,14 @@ on boot rather than leaving them permanently "running".
 LitmusLLM/
 ├── main.py                 # FastAPI app: pages, JSON API, HTMX fragments
 ├── eval_runner.py          # generate → judge loop, cancellation, comparisons
-├── llm_clients.py          # Ollama + LiteLLM transport, DeepEval judge adapter
-├── model_registry.py       # Ollama discovery, flagship list, model ids
+├── llm_clients.py          # local + LiteLLM transport, streaming, judge adapter
+├── runtimes.py             # Ollama / LM Studio / llama.cpp: probe, auto-start, discover
+├── model_registry.py       # model ids, ModelSpec, flagship cloud list
 ├── metrics_catalog.py      # metric definitions, thresholds, score direction
+├── scoring.py              # the Litmus Score composite + comparability tags
+├── perf.py                 # TTFT / throughput / token / cost measurement
+├── scorecard.py            # the cross-run comparison table and its CSV
+├── harness.py              # lm-eval driver: task catalogue, capability probe, subprocess
 ├── datasets.py             # built-in dataset, CSV parsing
 ├── benchmarks.py           # published third-party reference figures + provenance
 ├── database.py             # SQLite schema and queries

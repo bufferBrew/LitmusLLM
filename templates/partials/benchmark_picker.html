@@ -1,0 +1,103 @@
+{# Task chooser. Availability is model-specific -- Ollama can't run the
+   multiple-choice tasks at all -- so this fragment re-renders when the model
+   changes rather than letting someone start a run that cannot work. #}
+<form id="benchmark-picker" method="post" action="/api/benchmarks" class="space-y-4">
+  <div class="grid gap-4 sm:grid-cols-2">
+    <div>
+      <label for="bench-model" class="block text-sm font-medium">Model</label>
+      <select id="bench-model" name="model" required
+              hx-get="/ui/benchmark-picker" hx-target="#benchmark-picker"
+              hx-swap="outerHTML" hx-trigger="change" hx-include="this"
+              class="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm
+                     dark:border-slate-700 dark:bg-slate-900">
+        {% for m in chat_models %}
+          <option value="{{ m.id }}" {% if m.id == selected_model %}selected{% endif %}>
+            {{ m.name }} — {{ m.runtime_label }}{% if m.quantization and m.quantization != 'unknown' %} ({{ m.quantization }}){% endif %}
+          </option>
+        {% endfor %}
+      </select>
+      <p class="mt-1 text-xs text-slate-500 dark:text-slate-400">
+        Local runtimes only. Benchmarking a cloud model would need a LiteLLM proxy for the
+        harness to talk to.
+      </p>
+    </div>
+
+    <div>
+      <label for="bench-limit" class="block text-sm font-medium">Items to run</label>
+      <input id="bench-limit" type="number" name="limit" min="1" value="50"
+             class="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm
+                    dark:border-slate-700 dark:bg-slate-900">
+      <p class="mt-1 text-xs text-slate-500 dark:text-slate-400">
+        Fewer items finish sooner but widen the confidence interval. Below ~100, only large
+        gaps between models mean anything. Blank runs the full set.
+      </p>
+    </div>
+  </div>
+
+  {% if not harness_installed %}
+    <div class="rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-800
+                dark:border-red-500/40 dark:bg-red-500/10 dark:text-red-300">
+      <p class="font-semibold">lm-evaluation-harness is not installed</p>
+      <p class="mt-1">
+        Run <code class="rounded bg-red-100 px-1 dark:bg-red-500/20">pip install 'lm-eval[api,ifeval]'</code>
+        in this app&rsquo;s environment, then reload.
+      </p>
+    </div>
+  {% endif %}
+
+  <fieldset>
+    <legend class="text-sm font-medium">Benchmark</legend>
+    <div class="mt-2 grid gap-2 sm:grid-cols-2">
+      {% for task in tasks %}
+        {% set blocked = availability.blocked.get(task.key) if availability else none %}
+        <label class="flex gap-3 rounded-lg border p-3 text-sm
+                      {% if blocked %}cursor-not-allowed border-slate-200 bg-slate-50 opacity-60
+                         dark:border-slate-800 dark:bg-slate-950
+                      {% else %}cursor-pointer border-slate-200 bg-white hover:border-amber-400
+                         dark:border-slate-800 dark:bg-slate-900{% endif %}">
+          <input type="radio" name="task" value="{{ task.key }}" class="mt-1"
+                 {% if blocked %}disabled{% endif %}
+                 {% if loop.first and not blocked %}checked{% endif %}>
+          <span class="flex-1">
+            <span class="flex items-center gap-2">
+              <span class="font-medium">{{ task.label }}</span>
+              <span class="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] uppercase
+                           text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+                {{ task.metric_label }}
+              </span>
+            </span>
+            <span class="mt-1 block text-xs leading-relaxed text-slate-600 dark:text-slate-400">
+              {{ task.blurb }}
+            </span>
+            <span class="mt-1 block text-[11px] text-slate-400">
+              {{ '{:,}'.format(task.items) }} items
+              {%- if task.num_fewshot is not none %} &middot; {{ task.num_fewshot }}-shot{% endif %}
+            </span>
+            {% if blocked %}
+              <span class="mt-1 block text-[11px] text-amber-700 dark:text-amber-400">{{ blocked }}</span>
+            {% endif %}
+          </span>
+        </label>
+      {% endfor %}
+    </div>
+  </fieldset>
+
+  {# Code execution is opt-in per submission, never remembered. Running
+     model-written code is a decision worth making each time rather than a
+     setting that quietly stays on. #}
+  <label class="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs
+                text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-200">
+    <input type="checkbox" name="allow_code_execution" value="1" class="mt-0.5">
+    <span>
+      <strong>Allow code execution.</strong> HumanEval is scored by running Python the model
+      wrote, in this process, unsandboxed. Only tick this if you accept that. It applies to this
+      run alone.
+    </span>
+  </label>
+
+  <button type="submit" {% if not harness_installed %}disabled{% endif %}
+          class="rounded-md bg-amber-500 px-4 py-2 text-sm font-medium text-white
+                 hover:bg-amber-600 disabled:cursor-not-allowed disabled:opacity-50">
+    Run benchmark <span class="lit-spin">&hellip;</span>
+  </button>
+</form>

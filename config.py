@@ -29,9 +29,29 @@ def _path(key: str, default: str) -> Path:
     return raw if raw.is_absolute() else PROJECT_ROOT / raw
 
 
-# --- Ollama ---------------------------------------------------------------
+# --- Local inference runtimes ---------------------------------------------
+# Three local backends are supported, each on its own port. All three speak
+# OpenAI-compatible /v1/chat/completions, which is what lets one transport
+# drive all of them -- see runtimes.py for the differences that remain.
 OLLAMA_HOST = _env("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+LMSTUDIO_HOST = _env("LMSTUDIO_HOST", "http://localhost:1234").rstrip("/")
+LLAMACPP_HOST = _env("LLAMACPP_HOST", "http://localhost:8080").rstrip("/")
+
+# Which runtime an unprefixed model name belongs to, and the only one the app
+# will auto-start just to populate a page.
+DEFAULT_RUNTIME = _env("LITMUSLLM_DEFAULT_RUNTIME", "ollama")
+
+# llama.cpp is the one runtime with an open-ended launch line (GGUF path,
+# context size, GPU layers). Set this to the exact command you use and
+# LitmusLLM will run that instead of guessing.
+LLAMACPP_START_COMMAND = _env("LITMUSLLM_LLAMACPP_START", "")
+
+# How long to wait for an auto-started runtime to bind its port. llama.cpp
+# loading a large GGUF from a cold page cache needs more than Ollama does.
+RUNTIME_START_TIMEOUT = float(_env("LITMUSLLM_RUNTIME_START_TIMEOUT", "30"))
+
 # DeepEval's own docs use LOCAL_MODEL_BASE_URL, so we honour the same name.
+# It remains the Ollama default; per-runtime base URLs are derived in runtimes.py.
 LOCAL_MODEL_BASE_URL = _env("LOCAL_MODEL_BASE_URL", f"{OLLAMA_HOST}/v1").rstrip("/")
 LOCAL_MODEL_API_KEY = _env("LOCAL_MODEL_API_KEY", "ollama")
 

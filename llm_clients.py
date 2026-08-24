@@ -1,4 +1,4 @@
-"""LLM plumbing: one adapter that talks to both Ollama and cloud providers.
+"""LLM plumbing: one adapter that talks to every local runtime and every cloud provider.
 
 Two distinct jobs happen here, and it's worth being explicit about them
 because conflating them is the usual source of confusion in eval tooling:
@@ -10,10 +10,12 @@ because conflating them is the usual source of confusion in eval tooling:
      different) model to score that output. `JudgeModel` does this, and
      implements DeepEval's `DeepEvalBaseLLM` contract.
 
-Local models go through Ollama's **OpenAI-compatible** endpoint
-(`/v1/chat/completions`) rather than its native `/api/generate`, so the exact
-same request shape works for Ollama and for every cloud provider LiteLLM
-fronts.
+Local models go through their runtime's **OpenAI-compatible** endpoint
+(`/v1/chat/completions`) rather than any native API, so the exact same request
+shape works for Ollama, LM Studio, llama.cpp, and for every cloud provider
+LiteLLM fronts. Which host that endpoint lives on comes from the ModelSpec
+(`spec.base_url`), not from a global -- that is the whole reason a single
+comparison run can put the same weights under two different runtimes.
 
 The fiddly part is schema-constrained judging. DeepEval hands `a_generate` a
 Pydantic model and expects an instance back. Small local models are casual
@@ -33,11 +35,12 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, ValidationError
 
+import perf
+
 from config import (
     CLOUD_CONCURRENCY,
     LOCAL_CONCURRENCY,
     LOCAL_MODEL_API_KEY,
-    LOCAL_MODEL_BASE_URL,
     MAX_TOKENS,
     REQUEST_TIMEOUT,
     TEMPERATURE,
@@ -154,6 +157,15 @@ class _Transport:
         default = LOCAL_CONCURRENCY if spec.kind == "local" else CLOUD_CONCURRENCY
         self._sem = asyncio.Semaphore(concurrency or default)
 
+        # Resolved once, here, so every request path -- sync, async, judge --
+        # is guaranteed to hit the same endpoint for a given spec.
+        self._base_url = spec.base_url or ""
+        self._runtime_label = spec.runtime_label
+        # LM Studio and llama.cpp ignore the bearer token; Ollama's OpenAI
+        # shim wants one present. Sending it unconditionally is harmless and
+        # keeps one code path instead of three.
+        self._headers = {"Authorization": f"Bearer {LOCAL_MODEL_API_KEY}"}
+
         if spec.kind == "cloud" and spec.api_key_env and not os.getenv(spec.api_key_env):
             raise ModelCallError(
                 f"{spec.label} needs {spec.api_key_env}, which is not set. "
@@ -171,22 +183,135 @@ class _Transport:
     ) -> str:
         async with self._sem:
             if self.spec.kind == "local":
-                return await self._aollama(prompt, system, json_mode, max_tokens)
+                return await self._alocal(prompt, system, json_mode, max_tokens)
             return await self._alitellm(prompt, system, json_mode, max_tokens)
 
-    async def _aollama(
+    async def _alocal(
         self, prompt: str, system: str | None, json_mode: bool, max_tokens: int | None
     ) -> str:
         body = self._openai_body(prompt, system, json_mode, max_tokens)
-        headers = {"Authorization": f"Bearer {LOCAL_MODEL_API_KEY}"}
         try:
             async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
                 resp = await client.post(
-                    f"{LOCAL_MODEL_BASE_URL}/chat/completions", json=body, headers=headers
+                    f"{self._base_url}/chat/completions", json=body, headers=self._headers
                 )
         except httpx.HTTPError as exc:
-            raise ModelCallError(f"Could not reach Ollama at {LOCAL_MODEL_BASE_URL}: {exc}") from exc
+            raise ModelCallError(
+                f"Could not reach {self._runtime_label} at {self._base_url}: {exc}"
+            ) from exc
         return self._parse_openai(resp)
+
+    # -- measured (streaming) ---------------------------------------------
+    # Only the model under test goes down this path. Streaming is what makes
+    # time-to-first-token observable at all: a non-streamed request tells you
+    # when the whole answer arrived and nothing about when it started.
+
+    async def acomplete_measured(
+        self,
+        prompt: str,
+        *,
+        system: str | None = None,
+        max_tokens: int | None = None,
+    ) -> tuple[str, perf.CallMetrics]:
+        """Complete a prompt and report what it cost in time and tokens.
+
+        Falls back to a plain non-streamed call if streaming fails, because a
+        run losing its speed numbers is a far better outcome than a run losing
+        its results. The returned metrics say `streamed=False` in that case, so
+        a missing TTFT is distinguishable from a TTFT of zero.
+        """
+        async with self._sem:
+            try:
+                if self.spec.kind == "local":
+                    return await self._alocal_measured(prompt, system, max_tokens)
+                return await self._alitellm_measured(prompt, system, max_tokens)
+            except ModelCallError:
+                raise
+            except Exception:  # noqa: BLE001 - instrumentation must never fail a run
+                watch = perf.Stopwatch()
+                if self.spec.kind == "local":
+                    text = await self._alocal(prompt, system, False, max_tokens)
+                else:
+                    text = await self._alitellm(prompt, system, False, max_tokens)
+                return text, watch.finish(streamed=False)
+
+    async def _alocal_measured(
+        self, prompt: str, system: str | None, max_tokens: int | None
+    ) -> tuple[str, perf.CallMetrics]:
+        body = self._openai_body(prompt, system, False, max_tokens)
+        body["stream"] = True
+        # All three local runtimes honour this and emit a final usage-only
+        # chunk. Without it the stream ends with no token counts at all.
+        body["stream_options"] = {"include_usage": True}
+
+        chunks: list[str] = []
+        usage: dict[str, Any] = {}
+        watch = perf.Stopwatch()
+        try:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+                async with client.stream(
+                    "POST", f"{self._base_url}/chat/completions",
+                    json=body, headers=self._headers,
+                ) as resp:
+                    if resp.status_code >= 400:
+                        await resp.aread()
+                        return self._parse_openai(resp), watch.finish(streamed=False)
+                    async for line in resp.aiter_lines():
+                        piece, chunk_usage, done = _parse_sse_line(line)
+                        if chunk_usage:
+                            usage = chunk_usage
+                        if piece:
+                            watch.mark_first_token()
+                            chunks.append(piece)
+                        if done:
+                            break
+        except httpx.HTTPError as exc:
+            raise ModelCallError(
+                f"Could not reach {self._runtime_label} at {self._base_url}: {exc}"
+            ) from exc
+
+        return "".join(chunks).strip(), watch.finish(
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+            cost_usd=0.0,   # local inference has no invoice -- see perf.py
+            streamed=True,
+        )
+
+    async def _alitellm_measured(
+        self, prompt: str, system: str | None, max_tokens: int | None
+    ) -> tuple[str, perf.CallMetrics]:
+        from litellm import acompletion
+
+        kwargs = self._litellm_kwargs(prompt, system, False, max_tokens)
+        kwargs["stream"] = True
+        kwargs["stream_options"] = {"include_usage": True}
+
+        chunks: list[str] = []
+        usage: Any = None
+        watch = perf.Stopwatch()
+        try:
+            stream = await acompletion(**kwargs)
+            async for chunk in stream:
+                if getattr(chunk, "usage", None):
+                    usage = chunk.usage
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                piece = getattr(choices[0].delta, "content", None)
+                if piece:
+                    watch.mark_first_token()
+                    chunks.append(piece)
+        except Exception as exc:
+            raise ModelCallError(f"{self.spec.label}: {exc}") from exc
+
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        return "".join(chunks).strip(), watch.finish(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cost_usd=_estimate_cost(self.spec.name, prompt_tokens, completion_tokens),
+            streamed=True,
+        )
 
     async def _alitellm(
         self, prompt: str, system: str | None, json_mode: bool, max_tokens: int | None
@@ -223,15 +348,14 @@ class _Transport:
     ) -> str:
         if self.spec.kind == "local":
             body = self._openai_body(prompt, system, json_mode, max_tokens)
-            headers = {"Authorization": f"Bearer {LOCAL_MODEL_API_KEY}"}
             try:
                 with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
                     resp = client.post(
-                        f"{LOCAL_MODEL_BASE_URL}/chat/completions", json=body, headers=headers
+                        f"{self._base_url}/chat/completions", json=body, headers=self._headers
                     )
             except httpx.HTTPError as exc:
                 raise ModelCallError(
-                    f"Could not reach Ollama at {LOCAL_MODEL_BASE_URL}: {exc}"
+                    f"Could not reach {self._runtime_label} at {self._base_url}: {exc}"
                 ) from exc
             return self._parse_openai(resp)
 
@@ -284,21 +408,97 @@ class _Transport:
             kwargs["response_format"] = {"type": "json_object"}
         return kwargs
 
-    @staticmethod
-    def _parse_openai(resp: httpx.Response) -> str:
+    def _parse_openai(self, resp: httpx.Response) -> str:
+        label = self._runtime_label
         if resp.status_code >= 400:
             detail = resp.text[:400]
             if resp.status_code == 404:
                 raise ModelCallError(
-                    f"Ollama returned 404: {detail}. The model is probably not pulled "
-                    f"-- try `ollama pull <model>` or use the Pull button on /models."
+                    f"{label} returned 404 for '{self.spec.name}': {detail}. "
+                    f"{_missing_model_hint(self.spec)}"
                 )
-            raise ModelCallError(f"Ollama returned HTTP {resp.status_code}: {detail}")
+            raise ModelCallError(f"{label} returned HTTP {resp.status_code}: {detail}")
         try:
             data = resp.json()
             return (data["choices"][0]["message"]["content"] or "").strip()
         except (KeyError, IndexError, ValueError, TypeError) as exc:
-            raise ModelCallError(f"Unexpected response shape from Ollama: {exc}") from exc
+            raise ModelCallError(f"Unexpected response shape from {label}: {exc}") from exc
+
+
+def _parse_sse_line(line: str) -> tuple[str | None, dict[str, Any] | None, bool]:
+    """Decode one server-sent-events line into (text, usage, done).
+
+    The usage-only chunk at the end of a stream has an empty `choices` array,
+    so content and usage are pulled independently rather than assuming any
+    chunk carries both.
+    """
+    line = line.strip()
+    if not line or not line.startswith("data:"):
+        return None, None, False
+    payload = line[5:].strip()
+    if payload == "[DONE]":
+        return None, None, True
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None, None, False
+
+    usage = data.get("usage") or None
+    text = None
+    for choice in data.get("choices") or []:
+        delta = choice.get("delta") or {}
+        # A stream opens with a role-only delta and no content; returning None
+        # for it keeps that non-event out of the time-to-first-token mark.
+        content = delta.get("content")
+        if content:
+            text = (text or "") + content
+    return text, usage, False
+
+
+def _estimate_cost(
+    model: str, prompt_tokens: int | None, completion_tokens: int | None
+) -> float | None:
+    """Per-call cost from LiteLLM's own pricing tables.
+
+    Deliberately not a pricing table of our own. Prices change, and a stale
+    hardcoded rate reported to four decimal places is worse than admitting we
+    don't know -- an unknown model simply returns None.
+    """
+    if prompt_tokens is None and completion_tokens is None:
+        return None
+    try:
+        from litellm import cost_per_token
+
+        prompt_cost, completion_cost = cost_per_token(
+            model=model,
+            prompt_tokens=prompt_tokens or 0,
+            completion_tokens=completion_tokens or 0,
+        )
+        return round(float(prompt_cost) + float(completion_cost), 8)
+    except Exception:  # noqa: BLE001 - unpriced model, offline table, API drift
+        return None
+
+
+def _missing_model_hint(spec: ModelSpec) -> str:
+    """What to actually do about a 404, which is runtime-specific.
+
+    Ollama can fetch a missing model on request; the other two cannot, so
+    telling a llama.cpp user to `ollama pull` would just waste their time.
+    """
+    if spec.runtime == "ollama":
+        return (
+            f"The model is probably not pulled -- try `ollama pull {spec.name}` "
+            f"or use the Pull button on /models."
+        )
+    if spec.runtime == "lmstudio":
+        return (
+            "LM Studio only serves models it has downloaded. Check the model key on "
+            "/models, or download it in the LM Studio app."
+        )
+    return (
+        "llama.cpp serves only the models in its preset (or the single GGUF it was "
+        "launched with). Check the id on /models."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +518,10 @@ class TargetModel:
 
     async def generate(self, prompt: str) -> str:
         return await self._transport.acomplete(prompt, system=self.SYSTEM)
+
+    async def generate_measured(self, prompt: str) -> tuple[str, perf.CallMetrics]:
+        """Generate, and report what the generation cost in time and tokens."""
+        return await self._transport.acomplete_measured(prompt, system=self.SYSTEM)
 
 
 class JudgeModel:  # subclasses DeepEvalBaseLLM at construction time
