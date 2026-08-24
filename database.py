@@ -747,8 +747,10 @@ def delete_comparison_run(comparison_id: int) -> None:
         )]
         for cid in child_ids:
             conn.execute("DELETE FROM eval_results WHERE eval_run_id=?", (cid,))
-        conn.execute("DELETE FROM eval_runs WHERE comparison_run_id=?", (comparison_id,))
+        # comparison_results.eval_run_id references eval_runs without a cascade,
+        # so the results have to go before the runs they point at.
         conn.execute("DELETE FROM comparison_results WHERE comparison_run_id=?", (comparison_id,))
+        conn.execute("DELETE FROM eval_runs WHERE comparison_run_id=?", (comparison_id,))
         conn.execute("DELETE FROM comparison_runs WHERE id=?", (comparison_id,))
 
 
