@@ -406,8 +406,12 @@ def parse_results(payload: dict[str, Any], task: Task) -> Result:
         # Fall back to any metric that isn't a stderr, but say which one was
         # used -- silently reporting a different metric is how two runs of the
         # "same" benchmark end up not comparable.
+        # lm-eval names stderr entries '<metric>_stderr,<filter>', and the
+        # filter is whatever the task config set -- 'none', 'strict-match',
+        # 'flexible-extract'. Matching only '_stderr,none' let every other
+        # filter's stderr through as if it were the score.
         for name, value in block.items():
-            if not name.endswith("_stderr,none") and isinstance(value, (int, float)):
+            if "_stderr" not in name and isinstance(value, (int, float)):
                 score, metric_key = value, name
                 break
     if score is None:
