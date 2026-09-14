@@ -1,0 +1,13 @@
+[run]
+branch = True
+omit =
+    tests/*
+    .venv/*
+
+[report]
+# Show the app's own modules only -- counting the test files as covered code
+# inflates the figure with the tests' own lines.
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    raise NotImplementedError

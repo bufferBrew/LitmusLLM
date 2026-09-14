@@ -30,3 +30,10 @@ pydantic>=2.7.0
 # lm-eval[api]     -- the local-completions backends this app drives
 # lm-eval[ifeval]  -- langdetect/immutabledict, required by IFEval only
 # lm-eval>=0.4.5
+
+# --- Test dependencies ----------------------------------------------------
+# The suite covers the pure-logic modules (scoring, metrics catalogue, dataset
+# ingestion, perf maths, benchmark parsing, model identity) and needs no
+# network, no database and no model runtime.
+pytest>=8.0
+pytest-cov>=5.0
